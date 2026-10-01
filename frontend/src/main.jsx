@@ -7,7 +7,6 @@ import './styles.css'
 import './extras.css'
 import './admin/admin.css'
 import './admin/login.css'
-import './admin/upload.css'
 import './customer.css'
 import './account-nav.css'
 import './product-actions.css'
@@ -133,8 +132,11 @@ function ProductDetail({ products, add, setCart }) {
   const navigate = useNavigate()
   const product = products.find((entry) => entry.slug === slug) || products[0]
   const [size, setSize] = useState('1 kg')
+  const [flavour, setFlavour] = useState(product?.flavours?.[0] || '')
   const [quantity, setQuantity] = useState(1)
-  const selected = { ...product, basePrice: productPrice(product, size), size }
+  useEffect(() => { setFlavour(product?.flavours?.[0] || '') }, [product?.id])
+  if (!product) return <main className="page"><p className="muted">Loading cake details…</p></main>
+  const selected = { ...product, basePrice: productPrice(product, size), size, flavour }
   const updateQuantity = (value) => setQuantity(Math.max(1, Math.min(20, Number.parseInt(value, 10) || 1)))
   const buyNow = () => {
     const item = {
@@ -143,7 +145,7 @@ function ProductDetail({ products, add, setCart }) {
       slug: selected.slug,
       unitPrice: Number(selected.basePrice || 0),
       size: selected.size,
-      flavour: selected.flavours?.[0] || selected.name,
+      flavour: selected.flavour,
       quantity,
     }
     setCart([])
@@ -164,11 +166,16 @@ function ProductDetail({ products, add, setCart }) {
               {cakeSizes.map((option) => <option key={option}>{option}</option>)}
             </select>
           </label>
+          <label>Flavour
+            <select value={flavour} onChange={(event) => setFlavour(event.target.value)} required>
+              {(product.flavours || []).map((option) => <option key={option} value={option}>{option}</option>)}
+            </select>
+          </label>
           <label>Quantity
             <input type="number" min="1" max="20" value={quantity} onChange={(event) => updateQuantity(event.target.value)} />
           </label>
         </div>
-        <p className="product-flavour"><strong>Flavour:</strong> {(product.flavours || [product.name]).join(', ')}</p>
+        <p className="product-flavour"><strong>Selected flavour:</strong> {flavour || 'Not available'}</p>
         <div className="product-actions">
           <button className="button primary" onClick={() => add(selected, quantity)}>Add to bag <ShoppingBag size={17} /></button>
           <button className="button secondary" onClick={buyNow}>Buy now <ArrowRight size={17} /></button>
@@ -255,7 +262,7 @@ function App() {
       slug: product.slug,
       unitPrice: productPrice(product, product.size || '1 kg'),
       size: product.size || '1 kg',
-      flavour: product.flavours?.[0] || 'Vanilla',
+      flavour: product.flavour || product.flavours?.[0] || 'Vanilla',
       quantity: Math.max(1, Math.min(20, Number(quantity) || 1)),
     }
     setCart((items) => {

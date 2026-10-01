@@ -4,6 +4,8 @@ import { api, rotateSessionId, unwrap } from '../services/api'
 import { useNavigate } from 'react-router-dom'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
+const apiOrigin = (import.meta.env.VITE_API_URL || '/api').replace(/\/api\/?$/, '')
+const productImage = (image) => image?.startsWith('/api/') ? `${apiOrigin}${image}` : image || ''
 const tabs = [
   ['dashboard', 'Dashboard', LayoutDashboard],
   ['products', 'Products', Boxes],
@@ -20,6 +22,11 @@ function Stat({ label, value, tone = '' }) {
 
 function Empty({ text }) {
   return <div className="admin-empty">{text}</div>
+}
+
+function Pagination({ page, onPageChange }) {
+  if (!page) return null
+  return <div className="admin-pagination"><span>Page {page.page} of {page.pages} · {page.total} total</span><div><button type="button" className="admin-table-action" disabled={page.page <= 1} onClick={() => onPageChange(page.page - 1)}>Previous</button><button type="button" className="admin-table-action" disabled={page.page >= page.pages} onClick={() => onPageChange(page.page + 1)}>Next</button></div></div>
 }
 
 function Table({ children }) {
@@ -108,7 +115,7 @@ const emptyCoupon = { code: '', description: '', discountType: 'PERCENTAGE', dis
 function ProductForm({ product, onClose, onSaved }) {
   const [form, setForm] = useState(product ? { ...product, flavours: (product.flavours || []).join(', '), sizes: JSON.stringify(product.sizes || {}) } : emptyProduct)
   const [file, setFile] = useState(null)
-  const [preview, setPreview] = useState(product?.image || '')
+  const [preview, setPreview] = useState(productImage(product?.image))
   const [error, setError] = useState('')
   const save = async (event) => {
     event.preventDefault(); setError('')
@@ -141,7 +148,7 @@ function Products({ products, reload }) {
         <Table>
           {visible.map((product) => (
             <tr key={product.id}>
-              <td><img className="admin-product-thumb" src={product.image} alt=""/><strong>{product.name}</strong><small>{product.slug}</small></td>
+              <td><img className="admin-product-thumb" src={productImage(product.image)} alt=""/><strong>{product.name}</strong><small>{product.slug}</small></td>
               <td>{product.category}</td>
               <td>{money(product.basePrice)}</td>
               <td className="align-right"><button className="admin-table-action" onClick={() => setEditing(product)}><Pencil size={14}/> Edit</button><button className="admin-table-action danger" onClick={() => remove(product)}><Trash2 size={14}/> Delete</button></td>
@@ -155,7 +162,7 @@ function Products({ products, reload }) {
   )
 }
 
-function Orders({ orders, reload }) {
+function Orders({ orders, reload, pagination, onPageChange }) {
   const [query, setQuery] = useState('')
   const [expanded, setExpanded] = useState({})
   const [busyId, setBusyId] = useState(null)
@@ -213,11 +220,12 @@ function Orders({ orders, reload }) {
         </Table>
         {!visible.length && <Empty text="No orders match this search." />}
       </div>
+      <Pagination page={pagination} onPageChange={onPageChange} />
     </>
   )
 }
 
-function Customers({ customers }) {
+function Customers({ customers, pagination, onPageChange }) {
   return (
     <>
       <Header title="Customers" />
@@ -233,6 +241,7 @@ function Customers({ customers }) {
         </Table>
         {!customers?.length && <Empty text="No registered customers yet." />}
       </div>
+      <Pagination page={pagination} onPageChange={onPageChange} />
     </>
   )
 }
@@ -270,7 +279,7 @@ function Coupons({ coupons, reload }) {
   )
 }
 
-function Events({ events }) {
+function Events({ events, pagination, onPageChange }) {
   return (
     <>
       <Header title="Events & security" />
@@ -286,6 +295,7 @@ function Events({ events }) {
         </Table>
         {!events?.length && <Empty text="No events recorded yet." />}
       </div>
+      <Pagination page={pagination} onPageChange={onPageChange} />
     </>
   )
 }
@@ -306,24 +316,31 @@ export default function AdminPanel() {
   const [open, setOpen] = useState(false)
   const [data, setData] = useState({})
   const [error, setError] = useState('')
+  const [pages, setPages] = useState({ orders: 1, customers: 1, events: 1 })
 
-  const load = async () => {
+  const load = async (requestedPages = pages) => {
     try {
-      const result = await unwrap(api.get('/admin/dashboard'))
+      const result = await unwrap(api.get('/admin/dashboard', { params: { ordersPage: requestedPages.orders, customersPage: requestedPages.customers, eventsPage: requestedPages.events } }))
       setData(result.data || {})
     } catch (err) {
       setError(err.response?.data?.error?.message || 'Admin session expired.')
     }
   }
 
+  const changePage = (collection, page) => {
+    const nextPages = { ...pages, [collection]: page }
+    setPages(nextPages)
+    load(nextPages)
+  }
+
   useEffect(() => { load() }, [])
 
   const content = tab === 'dashboard' ? <Dashboard data={data} onNavigate={setTab} />
     : tab === 'products' ? <Products products={data.products || []} reload={load} />
-    : tab === 'orders' ? <Orders orders={data.allOrders || []} reload={load} />
-    : tab === 'customers' ? <Customers customers={data.customers || []} />
+    : tab === 'orders' ? <Orders orders={data.allOrders || []} reload={load} pagination={data.pagination?.orders} onPageChange={(page) => changePage('orders', page)} />
+    : tab === 'customers' ? <Customers customers={data.customers || []} pagination={data.pagination?.customers} onPageChange={(page) => changePage('customers', page)} />
     : tab === 'coupons' ? <Coupons coupons={data.coupons || []} reload={load} />
-    : tab === 'events' ? <Events events={data.events || []} />
+    : tab === 'events' ? <Events events={data.events || []} pagination={data.pagination?.events} onPageChange={(page) => changePage('events', page)} />
     : <RuleLock enabled={data.rulelockEnabled === true} configured={data.rulelockConfigured === true} reload={load} />
 
   return (

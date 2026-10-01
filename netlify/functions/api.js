@@ -8,14 +8,12 @@ const { createClient } = require("@supabase/supabase-js");
 const { createHash, randomBytes } = require("node:crypto");
 
 const { validateCoupons, recordUsage } = require("./lib/couponService");
-const { removeImagesByPrefix } = require("./lib/storageService");
 
 if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET_KEY || !process.env.ADMIN_PASSWORD)) {
   throw new Error("JWT_SECRET_KEY and ADMIN_PASSWORD are required in production.");
 }
 const SECRET_KEY = process.env.JWT_SECRET_KEY || randomBytes(32).toString("hex");
 const SECURITY_MODE = (process.env.CAKELY_SECURITY_MODE || "normal").toLowerCase();
-const PRODUCT_BUCKET = process.env.SUPABASE_PRODUCT_BUCKET || "product-images";
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const RULELOCK_API_URL = process.env.RULELOCK_API_URL || null;
@@ -256,6 +254,9 @@ async function codHistory(userId, excludeOrderId = null) {
 }
 
 function productAsDict(row) {
+  const image = typeof row.image === "string" && /^data:image\/[a-z0-9.+-]+;base64,/i.test(row.image)
+    ? `/api/products/${encodeURIComponent(row.slug)}/image`
+    : row.image;
   return {
     id: row.id,
     name: row.name,
@@ -263,8 +264,7 @@ function productAsDict(row) {
     description: row.description,
     category: row.category,
     basePrice: Number(row.base_price),
-    image: row.image,
-    imageKey: row.image_key || null,
+    image,
     flavours: row.flavours,
     sizes: row.sizes,
     active: row.active,
@@ -342,7 +342,7 @@ app.get("/rulelock/warm", (_req, res) => {
 });
 
 app.get("/products", async (req, res) => {
-  let query = supabase.from("products").select("*").eq("active", true).neq("category", "Custom").order("id");
+  let query = supabase.from("products").select("*").eq("active", true).order("id");
   const { category, search } = req.query;
   if (category && category !== "All cakes") query = query.eq("category", category);
   if (search) query = query.ilike("name", `%${search}%`);
@@ -352,9 +352,19 @@ app.get("/products", async (req, res) => {
 });
 
 app.get("/products/:slug", async (req, res) => {
-  const { data } = await supabase.from("products").select("*").eq("slug", req.params.slug).eq("active", true).neq("category", "Custom").maybeSingle();
+  const { data } = await supabase.from("products").select("*").eq("slug", req.params.slug).eq("active", true).maybeSingle();
   if (!data) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Product not found." } });
   res.json({ success: true, data: productAsDict(data) });
+});
+
+app.get("/products/:slug/image", async (req, res) => {
+  const { data: product, error } = await supabase.from("products").select("image").eq("slug", req.params.slug).eq("active", true).maybeSingle();
+  if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
+  const match = /^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i.exec(product?.image || "");
+  if (!match) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Product image not found." } });
+  const image = Buffer.from(match[2], "base64");
+  res.set("Cache-Control", "public, max-age=3600, stale-while-revalidate=86400");
+  res.type(match[1]).send(image);
 });
 
 app.get("/coupons", async (_req, res) => {
@@ -495,8 +505,12 @@ app.post("/checkout", async (req, res) => {
     if (price == null) {
       return res.status(400).json({ success: false, error: { code: "SIZE_UNAVAILABLE", message: "Choose an available cake size." } });
     }
+    const flavour = entry.flavour ?? item.flavours?.[0];
+    if (!Array.isArray(item.flavours) || !item.flavours.includes(flavour)) {
+      return res.status(400).json({ success: false, error: { code: "FLAVOUR_UNAVAILABLE", message: "Choose an available cake flavour." } });
+    }
     subtotal += price * quantity;
-    verifiedItems.push({ productId: item.id, name: item.name, size, flavour: item.flavours?.[0] || entry.flavour || item.name, quantity, unitPrice: price });
+    verifiedItems.push({ productId: item.id, name: item.name, size, flavour, quantity, unitPrice: price });
   }
 
   const couponResult = await validateCoupons({ codes: data.coupons || [], subtotal, user, paymentMethod: data.paymentMethod, securityMode: SECURITY_MODE, supabase });
@@ -654,23 +668,57 @@ app.get("/admin/summary", async (req, res) => {
   });
 });
 
+const DASHBOARD_PAGE_SIZE = 20;
+function dashboardPage(value) {
+  const page = Number(value || 1);
+  return Number.isSafeInteger(page) && page > 0 ? Math.min(page, 100000) : 1;
+}
+
 app.get("/admin/dashboard", async (req, res) => {
   const admin = await requireAdmin(req, res);
   if (!admin) return;
 
-  const { data: allOrders } = await supabase.from("orders").select("*").order("created_at", { ascending: false });
-  const { data: customers } = await supabase.from("users").select("*").eq("is_admin", false).order("created_at", { ascending: false });
-  const { data: coupons } = await supabase.from("coupons").select("*").order("created_at", { ascending: false });
-  const { data: events } = await supabase.from("transaction_events").select("*").order("created_at", { ascending: false }).limit(20);
-  const { data: products } = await supabase.from("products").select("*").order("id");
-  const { data: platformSettings } = await supabase.from("platform_settings").select("rulelock_enabled").eq("id", 1).maybeSingle();
+  const pages = {
+    orders: dashboardPage(req.query.ordersPage),
+    customers: dashboardPage(req.query.customersPage),
+    events: dashboardPage(req.query.eventsPage),
+  };
+  const range = (page) => [(page - 1) * DASHBOARD_PAGE_SIZE, page * DASHBOARD_PAGE_SIZE - 1];
+  const recentOrdersRequest = pages.orders === 1
+    ? Promise.resolve(null)
+    : supabase.from("orders").select("*").order("created_at", { ascending: false }).range(0, 5);
+  const [ordersResult, customersResult, eventsResult, { data: coupons }, { data: products }, { data: platformSettings }, { data: metricsRows, error: metricsError }, recentOrdersResult] = await Promise.all([
+    supabase.from("orders").select("*", { count: "exact" }).order("created_at", { ascending: false }).range(...range(pages.orders)),
+    supabase.from("users").select("*", { count: "exact" }).eq("is_admin", false).order("created_at", { ascending: false }).range(...range(pages.customers)),
+    supabase.from("transaction_events").select("*", { count: "exact" }).order("created_at", { ascending: false }).range(...range(pages.events)),
+    supabase.from("coupons").select("*").order("created_at", { ascending: false }),
+    supabase.from("products").select("*").order("id"),
+    supabase.from("platform_settings").select("rulelock_enabled").eq("id", 1).maybeSingle(),
+    supabase.rpc("admin_dashboard_metrics"),
+    recentOrdersRequest,
+  ]);
+  if (metricsError) return res.status(500).json({ success: false, error: { code: "DASHBOARD_METRICS_UNAVAILABLE", message: "Dashboard metrics are unavailable. Apply the latest Supabase migration." } });
+  const allOrders = ordersResult.data || [];
+  const recentOrderRows = pages.orders === 1 ? allOrders.slice(0, 6) : recentOrdersResult?.data || [];
+  const customers = customersResult.data || [];
+  const events = eventsResult.data || [];
+  const orderCustomerIds = [...new Set([...allOrders, ...recentOrderRows].map((order) => order.user_id).filter((id) => id != null))];
+  const orderCustomersResult = orderCustomerIds.length
+    ? await supabase.from("users").select("id,username,email").in("id", orderCustomerIds)
+    : { data: [], error: null };
+  if (orderCustomersResult.error) return res.status(500).json({ success: false, error: { code: "DASHBOARD_CUSTOMERS_UNAVAILABLE", message: "Order customer details are unavailable." } });
+  const customerStatsResult = customers.length
+    ? await supabase.rpc("admin_dashboard_customer_stats", { p_user_ids: customers.map((customer) => customer.id) })
+    : { data: [], error: null };
+  if (customerStatsResult.error) return res.status(500).json({ success: false, error: { code: "DASHBOARD_METRICS_UNAVAILABLE", message: "Customer order totals are unavailable. Apply the latest Supabase migration." } });
+  const statsByUser = new Map((customerStatsResult.data || []).map((row) => [String(row.user_id), row]));
 
-  const usernameById = new Map((customers || []).map((c) => [c.id, c.username]));
-  const orderDicts = (allOrders || []).map((row) => ({
+  const orderCustomerById = new Map((orderCustomersResult.data || []).map((c) => [String(c.id), c]));
+  const orderDict = (row) => ({
     id: row.id,
     orderNumber: row.order_number,
-    customer: usernameById.get(row.user_id) || null,
-    customerEmail: customers?.find((customer) => customer.id === row.user_id)?.email || null,
+    customer: orderCustomerById.get(String(row.user_id))?.username || null,
+    customerEmail: orderCustomerById.get(String(row.user_id))?.email || null,
     items: row.items || [],
     address: row.address || {},
     subtotal: Number(row.subtotal),
@@ -682,36 +730,36 @@ app.get("/admin/dashboard", async (req, res) => {
     paymentStatus: row.payment_status,
     fulfillmentMethod: row.address?.fulfillmentMethod || "DELIVERY",
     createdAt: row.created_at,
-  }));
+  });
+  const orderDicts = allOrders.map(orderDict);
+  const recentOrderDicts = recentOrderRows.map(orderDict);
 
-  const spendingByUser = new Map();
-  for (const order of allOrders || []) {
-    spendingByUser.set(order.user_id, (spendingByUser.get(order.user_id) || 0) + Number(order.total));
-  }
-  const customerDicts = (customers || []).map((row) => ({
+  const customerDicts = customers.map((row) => ({
     id: row.id,
     username: row.username,
     email: row.email,
-    orders: (allOrders || []).filter((o) => o.user_id === row.id).length,
-    spending: spendingByUser.get(row.id) || 0,
+    orders: Number(statsByUser.get(String(row.id))?.orders || 0),
+    spending: Number(statsByUser.get(String(row.id))?.spending || 0),
     createdAt: row.created_at,
   }));
 
   const couponDicts = (coupons || []).map((row) => ({ id: row.id, code: row.code, description: row.description, discountType: row.discount_type, discountValue: Number(row.discount_value), active: row.active }));
-  const eventDicts = (events || []).map((row) => ({ id: row.id, eventId: row.event_id, eventType: row.event_type, orderId: row.order_id, createdAt: row.created_at }));
+  const eventDicts = events.map((row) => ({ id: row.id, eventId: row.event_id, eventType: row.event_type, orderId: row.order_id, createdAt: row.created_at }));
+  const metrics = Array.isArray(metricsRows) ? metricsRows[0] : metricsRows;
+  const pageInfo = (page, total) => ({ page, pageSize: DASHBOARD_PAGE_SIZE, total: Number(total || 0), pages: Math.max(1, Math.ceil(Number(total || 0) / DASHBOARD_PAGE_SIZE)) });
 
   res.json({
     success: true,
     data: {
-      orders: (allOrders || []).length,
-      pending: (allOrders || []).filter((o) => o.status === "PENDING").length,
-      preparing: (allOrders || []).filter((o) => o.status === "PREPARING").length,
-      completed: (allOrders || []).filter((o) => o.status === "COMPLETED").length,
-      customerCount: (customers || []).length,
+      orders: Number(metrics?.order_count || 0),
+      pending: Number(metrics?.pending_count || 0),
+      preparing: Number(metrics?.preparing_count || 0),
+      completed: Number(metrics?.completed_count || 0),
+      customerCount: Number(metrics?.customer_count || 0),
       productCount: (products || []).length,
       couponCount: (coupons || []).filter((c) => c.active).length,
-      revenue: (allOrders || []).reduce((sum, o) => sum + Number(o.total), 0),
-      recentOrders: orderDicts.slice(0, 6),
+      revenue: Number(metrics?.revenue || 0),
+      recentOrders: recentOrderDicts,
       allOrders: orderDicts,
       customers: customerDicts,
       products: (products || []).map(productAsDict),
@@ -719,6 +767,11 @@ app.get("/admin/dashboard", async (req, res) => {
       events: eventDicts,
       rulelockEnabled: platformSettings?.rulelock_enabled === true,
       rulelockConfigured: Boolean(RULELOCK_API_URL),
+      pagination: {
+        orders: pageInfo(pages.orders, ordersResult.count),
+        customers: pageInfo(pages.customers, customersResult.count),
+        events: pageInfo(pages.events, eventsResult.count),
+      },
     },
   });
 });
@@ -807,14 +860,9 @@ app.delete("/admin/products/:id", async (req, res) => {
   const admin = await requireAdmin(req, res);
   if (!admin) return;
   const productId = Number(req.params.id);
-  const { data: row, error: lookupError } = await supabase.from("products").select("id,image").eq("id", productId).maybeSingle();
+  const { data: row, error: lookupError } = await supabase.from("products").select("id").eq("id", productId).maybeSingle();
   if (lookupError) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: lookupError.message } });
   if (!row) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Product not found." } });
-  try {
-    await removeImagesByPrefix({ bucket: PRODUCT_BUCKET, prefix: `product_${productId}_`, supabase });
-  } catch (err) {
-    console.error("product image cleanup failed:", err.message);
-  }
   const { error } = await supabase.from("products").delete().eq("id", productId);
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
   await record("ADMIN_PRODUCT_DELETED", { productId }, admin.id, null, req.headers["x-session-id"] || null, requestEventContext(req, admin));

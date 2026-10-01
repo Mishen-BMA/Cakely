@@ -8,22 +8,26 @@ const require = createRequire(import.meta.url)
 const apiPath = require.resolve('../api.js')
 const user = { id: 7, username: 'customer', email: 'customer@example.test', is_admin: false, rate_limited_until: null }
 const admin = { id: 1, username: 'admin', is_admin: true }
-const product = { id: 12, name: 'Cake', active: true, base_price: 1000, flavours: ['Vanilla'], sizes: { '1 kg': 1000 } }
+const product = { id: 12, name: 'Cake', slug: 'cake', active: true, base_price: 1000, image: 'data:image/png;base64,aGVsbG8=', flavours: ['Vanilla', 'Chocolate'], sizes: { '1 kg': 1000 } }
 
 function makeDatabase() {
-  const state = { orders: [], events: [], couponUsages: [], user: { ...user, password_hash: null }, admin: { ...admin, email: 'admin@cakely.lk', password_hash: null }, enabled: true, nextOrderId: 20, rpcCalls: [], firstOrderOnly: false }
+  const state = { orders: [], events: [], couponUsages: [], user: { ...user, password_hash: null }, admin: { ...admin, email: 'admin@cakely.lk', password_hash: null }, enabled: true, nextOrderId: 20, rpcCalls: [], ranges: [], firstOrderOnly: false }
   const resolve = (query) => {
     const { table, operation, payload, filters } = query
-    const match = (row) => filters.every(([key, value, mode]) => mode === 'neq' ? row?.[key] !== value : mode === 'or' ? true : String(row?.[key]) === String(value))
+    const match = (row) => filters.every(([key, value, mode]) => mode === 'neq' ? row?.[key] !== value : mode === 'in' ? value.map(String).includes(String(row?.[key])) : String(row?.[key]) === String(value))
     if (table === 'users') {
       if (operation === 'select') {
         const idFilter = filters.find(([key]) => key === 'id')
-        if (idFilter) return { data: String(idFilter[1]) === String(state.admin.id) ? state.admin : String(idFilter[1]) === String(state.user.id) ? state.user : null, error: null }
+        if (idFilter) {
+          if (Array.isArray(idFilter[1])) return { data: [state.user, state.admin].filter((candidate) => idFilter[1].map(String).includes(String(candidate.id))), error: null }
+          return { data: String(idFilter[1]) === String(state.admin.id) ? state.admin : String(idFilter[1]) === String(state.user.id) ? state.user : null, error: null }
+        }
         const identity = filters.find(([key]) => key === 'username' || key === 'email')
         if (identity) {
           const [key, value] = identity
           return { data: String(state.admin[key]).toLowerCase() === String(value).toLowerCase() ? state.admin : String(state.user[key]).toLowerCase() === String(value).toLowerCase() ? state.user : null, error: null }
         }
+        if (filters.some(([key, value]) => key === 'is_admin' && value === false)) return { data: [state.user], count: 1, error: null }
         return { data: null, error: null }
       }
       if (operation === 'update') {
@@ -33,7 +37,7 @@ function makeDatabase() {
       if (operation === 'insert') { state.registeredUser = payload; return { data: { ...payload, id: 9 }, error: null } }
       return { data: null, error: null }
     }
-    if (table === 'products') return { data: product, error: null }
+    if (table === 'products') return { data: [product], count: 1, error: null }
     if (table === 'platform_settings') {
       if (operation === 'upsert') { state.enabled = payload.rulelock_enabled; return { data: { rulelock_enabled: state.enabled }, error: null } }
       return { data: { rulelock_enabled: state.enabled }, error: null }
@@ -59,11 +63,12 @@ function makeDatabase() {
         Object.assign(row, payload)
         return { data: row, error: null }
       }
-      return { data: filters.some(([key, , mode]) => key === 'id' && mode !== 'neq') ? state.orders.find(match) || null : state.orders.filter(match), error: null }
+      const rows = filters.some(([key, , mode]) => key === 'id' && mode !== 'neq') ? state.orders.find(match) || null : state.orders.filter(match)
+      return { data: Array.isArray(rows) && query.range ? rows.slice(query.range[0], query.range[1] + 1) : rows, count: Array.isArray(rows) ? rows.length : rows ? 1 : 0, error: null }
     }
     if (table === 'transaction_events') {
       if (operation === 'insert') { state.events.push(payload); return { data: payload, error: null } }
-      return { data: null, count: 0, error: null }
+      return { data: query.range ? state.events.slice(query.range[0], query.range[1] + 1) : state.events, count: state.events.length, error: null }
     }
     return { data: null, error: null }
   }
@@ -73,6 +78,8 @@ function makeDatabase() {
       for (const coupon_id of args.p_coupon_ids) state.couponUsages.push({ coupon_id, user_id: args.p_user_id, order_id: args.p_order_id })
       return Promise.resolve({ data: null, error: null })
     }
+    if (name === 'admin_dashboard_metrics') return Promise.resolve({ data: [{ order_count: state.orders.length, pending_count: state.orders.filter((row) => row.status === 'PENDING').length, preparing_count: state.orders.filter((row) => row.status === 'PREPARING').length, completed_count: state.orders.filter((row) => row.status === 'COMPLETED').length, revenue: state.orders.reduce((total, row) => total + Number(row.total || 0), 0), customer_count: 1 }], error: null })
+    if (name === 'admin_dashboard_customer_stats') return Promise.resolve({ data: args.p_user_ids.map((user_id) => ({ user_id, orders: state.orders.filter((row) => String(row.user_id) === String(user_id)).length, spending: state.orders.filter((row) => String(row.user_id) === String(user_id)).reduce((total, row) => total + Number(row.total || 0), 0) })), error: null })
     return Promise.resolve({ data: null, error: { message: 'Unknown RPC' } })
   }, from(table) {
     const query = { table, operation: 'select', filters: [], payload: null }
@@ -84,10 +91,12 @@ function makeDatabase() {
       delete() { query.operation = 'delete'; return chain },
       eq(key, value) { query.filters.push([key, value]); return chain },
       neq(key, value) { query.filters.push([key, value, 'neq']); return chain },
+      in(key, value) { query.filters.push([key, value, 'in']); return chain },
       order() { return chain },
       limit() { return chain },
-      single() { return Promise.resolve(resolve(query)) },
-      maybeSingle() { return Promise.resolve(resolve(query)) },
+      range(from, to) { query.range = [from, to]; state.ranges.push({ table, from, to }); return chain },
+      single() { return Promise.resolve(resolve(query)).then((result) => ({ ...result, data: Array.isArray(result.data) ? result.data[0] || null : result.data })) },
+      maybeSingle() { return Promise.resolve(resolve(query)).then((result) => ({ ...result, data: Array.isArray(result.data) ? result.data[0] || null : result.data })) },
       then(yes, no) { return Promise.resolve(resolve(query)).then(yes, no) },
     }
     return chain
@@ -142,10 +151,13 @@ describe('RuleLock checkout contract', () => {
     expect(options.headers.Authorization).toBe('Bearer test-token')
     expect(options.headers['X-Session-ID']).toBe('session-test')
     expect(body).toMatchObject({ order_id: 20, order_reference: expect.stringMatching(/^CK-\d{14}-[A-Z0-9]{4}$/), account_id: '7', payment_method: 'CARD', items: [{ sku: 'sku-12', name: 'Cake', size: '1 kg', quantity: 1, unit_price: 1000 }] })
+    expect(Object.keys(body).sort()).toEqual(['order_id', 'order_reference', 'account_id', 'user_id', 'customer_name', 'session_id', 'device_id', 'phone_hash', 'address_hash', 'payment_method', 'items', 'coupons_applied', 'discount_value', 'subtotal', 'total', 'account_verified', 'past_orders', 'past_refusals'].sort())
+    expect(Object.keys(body.items[0]).sort()).toEqual(['sku', 'name', 'size', 'quantity', 'unit_price'].sort())
     expect(body.phone_hash).toMatch(/^[a-f0-9]{64}$/)
     expect(body.address_hash).toMatch(/^[a-f0-9]{64}$/)
     expect(body).not.toHaveProperty('phone')
     expect(body).not.toHaveProperty('address')
+    expect(Object.keys(rulelockResponse('accept')).sort()).toEqual(['order_id', 'decision', 'payment_action', 'reason', 'customer_message', 'account_action', 'rule_result', 'anomaly_result', 'enforcement_result'].sort())
     expect(db.state.orders[0]).toMatchObject({ payment_status: 'PAID', status: 'PENDING' })
     expect(response.body.data.status).toBe('PENDING')
     expect(db.state.events.some((event) => event.event_type === 'RULELOCK_REVIEW')).toBe(false)
@@ -289,6 +301,39 @@ describe('RuleLock checkout contract', () => {
   it('validates identifiers before querying authentication records', async () => {
     await request(app).post('/auth/login').send({ identifier: 'x",email.eq.admin@example.test', password: 'anything' }).expect(400)
     await request(app).post('/auth/register').send({ username: 'x",or(id.gt.0)', email: 'not-an-email', password: 'long-enough-password' }).expect(400)
+  })
+
+  it('validates a requested product flavour against the database flavours', async () => {
+    await checkout({ items: [{ productId: 12, size: '1 kg', quantity: 1, flavour: 'Pistachio' }] }).expect(400)
+    expect(db.state.orders).toHaveLength(0)
+    expect(fetch).not.toHaveBeenCalled()
+
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout({ items: [{ productId: 12, size: '1 kg', quantity: 1, flavour: 'Chocolate' }] }).expect(201)
+    expect(db.state.orders[0].items[0].flavour).toBe('Chocolate')
+  })
+
+  it('returns image URLs instead of base64 on product lists and serves cached image bytes', async () => {
+    const listing = await request(app).get('/products').expect(200)
+    expect(listing.body.data[0].image).toBe('/api/products/cake/image')
+    expect(JSON.stringify(listing.body)).not.toContain('aGVsbG8=')
+    const image = await request(app).get('/products/cake/image').expect(200)
+    expect(image.headers['content-type']).toMatch(/^image\/png/)
+    expect(image.headers['cache-control']).toContain('max-age=3600')
+    expect(image.body.toString()).toBe('hello')
+  })
+
+  it('paginates dashboard orders, customers, and events with totals', async () => {
+    db.state.orders.push(...Array.from({ length: 25 }, (_, index) => ({ id: index + 1, user_id: 7, status: 'PENDING', total: 100, created_at: new Date().toISOString() })))
+    db.state.events.push(...Array.from({ length: 25 }, (_, index) => ({ id: index + 1, event_id: `event-${index}`, event_type: 'LOGIN', created_at: new Date().toISOString() })))
+    const authorization = `Bearer ${jwt.sign({ sub: '1', role: 'admin' }, 'unit-test-jwt-secret')}`
+    const response = await request(app).get('/admin/dashboard?ordersPage=2&customersPage=1&eventsPage=2').set('Authorization', authorization).expect(200)
+    expect(response.body.data.allOrders).toHaveLength(5)
+    expect(response.body.data.events).toHaveLength(5)
+    expect(response.body.data.products[0].image).toBe('/api/products/cake/image')
+    expect(response.body.data.pagination.orders).toMatchObject({ page: 2, pageSize: 20, total: 25, pages: 2 })
+    expect(response.body.data.pagination.events).toMatchObject({ page: 2, total: 25, pages: 2 })
+    expect(db.state.ranges).toEqual(expect.arrayContaining([{ table: 'orders', from: 20, to: 39 }, { table: 'users', from: 0, to: 19 }, { table: 'transaction_events', from: 20, to: 39 }]))
   })
 })
 

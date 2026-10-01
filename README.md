@@ -8,7 +8,7 @@ database, all deployable on free tiers.
 
 - **Frontend:** React + Vite, served as a static site by Netlify
 - **Backend:** Express app running inside one Netlify Function (`netlify/functions/api.js`)
-- **Database + file storage:** Supabase Postgres for products and product images; Supabase Storage for custom-cake uploads
+- **Database:** Supabase Postgres for products, product images, orders, and customer accounts
 - **Hosting:** Netlify (frontend and backend both, on the same domain)
 
 This replaces the earlier Flask/SQLAlchemy backend — Netlify Functions don't
@@ -22,11 +22,7 @@ ported to Node while keeping the exact same `/api/...` routes and behavior.
    This creates all the tables and locks them down with Row Level Security
    (only your backend's secret key can read/write — nothing is publicly
    accessible).
-2. **Create two storage buckets** (Storage → New bucket), both set to
-   **Public**:
-   - `product-images`
-   - `custom-cakes`
-3. **Get your keys.** Project Settings → Data API for the project URL,
+2. **Get your keys.** Project Settings → Data API for the project URL,
    Project Settings → API Keys for the secret key (`sb_secret_...`).
 
 ## One-time seed (admin user + starter products + coupons)
@@ -54,10 +50,12 @@ coupon codes (`CAKE10`, `CAKE20`, `SAVE500`, etc.).
    variables** and add:
    - `SUPABASE_URL`
    - `SUPABASE_SECRET_KEY`
-   - `SUPABASE_PRODUCT_BUCKET` = `product-images`
-   - `SUPABASE_CUSTOM_CAKE_BUCKET` = `custom-cakes`
    - `JWT_SECRET_KEY` — any long random string
    - `ADMIN_USERNAME`, `ADMIN_PASSWORD`
+   - `EVENT_HASH_SALT` — a long random value used to hash contact details in events
+   - `ADMIN_RESET_PASSWORD=false` unless you intend to reset an existing admin password
+   - `RULELOCK_API_URL` — base URL only, such as `https://rulelock.example` (Cakely appends `/review-order`)
+   - `RULELOCK_API_TOKEN` when RuleLock is enabled
    - `CAKELY_SECURITY_MODE` = `normal`
    - Leave `FRONTEND_URL` and `VITE_API_URL` blank — frontend and backend
      share the same Netlify domain, so no CORS setup is needed.
@@ -94,8 +92,8 @@ Before deploying, enter the values marked as secret in the Render setup:
 - `ADMIN_USERNAME`
 - `ADMIN_PASSWORD`
 
-`SUPABASE_PRODUCT_BUCKET`, `SUPABASE_CUSTOM_CAKE_BUCKET`, and
-`CAKELY_SECURITY_MODE=normal` are included in the Blueprint. Do not set
+`CAKELY_SECURITY_MODE=normal` is included in the Blueprint. Configure
+`EVENT_HASH_SALT` and RuleLock credentials if required. Do not set
 `VITE_API_URL`; the frontend uses the same Render domain at `/api`.
 
 ## Deploy the frontend to GitHub Pages (Render API + Supabase)
@@ -124,10 +122,9 @@ need server-side rewrite rules.
 
 ## Notes / limitations to know about
 
-- **Product images are database-backed.** Admin product uploads are stored as
-   validated data URLs in `products.image`, so storefront images do not depend
-   on a public product-image bucket. Custom-cake uploads continue to use the
-   public `custom-cakes` Storage bucket.
+- **Product images are database-backed.** Admin product uploads are stored in
+  `products.image`; product list APIs return cached image URLs instead of the
+  base64 image data.
 - **Rate limiting is per-instance, not global.** The login/register rate
   limiter (`netlify/functions/api.js`) is in-memory per warm function
   container, so it resets on cold starts and isn't shared across concurrent
@@ -140,3 +137,17 @@ need server-side rewrite rules.
 - **Security mode:** keep `CAKELY_SECURITY_MODE=normal` in production.
   `research` mode intentionally disables coupon-stacking protection and
   exists only for demonstrating the vulnerability in a controlled way.
+
+## Tests and CI
+
+Install root and frontend dependencies, then run the tests:
+
+```bash
+npm ci
+npm ci --prefix frontend
+npm test
+```
+
+The GitHub Actions workflow
+`.github/workflows/backend-tests.yml` runs the backend contract and API tests
+for pushes and pull requests.

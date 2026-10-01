@@ -12,15 +12,19 @@ services:
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
-      - key: SUPABASE_PRODUCT_BUCKET
-        value: product-images
-      - key: SUPABASE_CUSTOM_CAKE_BUCKET
-        value: custom-cakes
       - key: JWT_SECRET_KEY
         sync: false
       - key: ADMIN_USERNAME
         sync: false
       - key: ADMIN_PASSWORD
+        sync: false
+      - key: ADMIN_RESET_PASSWORD
+        value: "false"
+      - key: EVENT_HASH_SALT
+        sync: false
+      - key: RULELOCK_API_URL
+        sync: false
+      - key: RULELOCK_API_TOKEN
         sync: false
       - key: CAKELY_SECURITY_MODE
         value: normal
