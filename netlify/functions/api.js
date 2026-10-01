@@ -5,14 +5,19 @@ const multer = require("multer");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const { createClient } = require("@supabase/supabase-js");
-const { createHash } = require("node:crypto");
+const { createHash, randomBytes } = require("node:crypto");
 
 const { validateCoupons, recordUsage } = require("./lib/couponService");
 const { removeImagesByPrefix } = require("./lib/storageService");
 
-const SECRET_KEY = process.env.JWT_SECRET_KEY || process.env.SECRET_KEY || "dev-only-change-me";
+if (process.env.NODE_ENV === "production" && (!process.env.JWT_SECRET_KEY || !process.env.ADMIN_PASSWORD)) {
+  throw new Error("JWT_SECRET_KEY and ADMIN_PASSWORD are required in production.");
+}
+const SECRET_KEY = process.env.JWT_SECRET_KEY || randomBytes(32).toString("hex");
 const SECURITY_MODE = (process.env.CAKELY_SECURITY_MODE || "normal").toLowerCase();
 const PRODUCT_BUCKET = process.env.SUPABASE_PRODUCT_BUCKET || "product-images";
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const RULELOCK_API_URL = process.env.RULELOCK_API_URL || null;
 const RULELOCK_API_TOKEN = process.env.RULELOCK_API_TOKEN || null;
 const RULELOCK_TIMEOUT_MS = 8000;
@@ -25,6 +30,7 @@ const supabase = (process.env.NODE_ENV === "test" && global.__CAKELY_SUPABASE_CL
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 
 const app = express();
+app.set("trust proxy", 1);
 
 // Strip the Netlify function path prefix so routes below can be defined
 // exactly like the original Flask `/api/...` routes, minus the `/api`.
@@ -60,24 +66,53 @@ async function ensureAdmin() {
   if (adminEnsured) return;
   adminEnsured = true;
   try {
-    const username = process.env.ADMIN_USERNAME || "admin";
-    const password = process.env.ADMIN_PASSWORD || "admin123";
-    const email = `${username}@cakely.lk`;
-    const passwordHash = await bcrypt.hash(password, 10);
-    const { data: existing } = await supabase.from("users").select("id").or(`username.eq.${username},email.eq.${email}`).maybeSingle();
+    if (!isValidUsername(ADMIN_USERNAME)) throw new Error("ADMIN_USERNAME has an invalid format.");
+    const email = `${ADMIN_USERNAME}@cakely.lk`;
+    const [{ data: byUsername }, { data: byEmail }] = await Promise.all([
+      supabase.from("users").select("*").eq("username", ADMIN_USERNAME).maybeSingle(),
+      supabase.from("users").select("*").eq("email", email).maybeSingle(),
+    ]);
+    if (byUsername && byEmail && byUsername.id !== byEmail.id) throw new Error("Configured admin username and email belong to different accounts.");
+    const existing = byUsername || byEmail;
     if (existing) {
-      await supabase.from("users").update({ username, is_admin: true, password_hash: passwordHash }).eq("id", existing.id);
-    } else {
-      await supabase.from("users").insert({ username, email, is_admin: true, password_hash: passwordHash });
+      if (!existing.is_admin) throw new Error("Configured admin identity belongs to a non-admin account.");
+      if (process.env.ADMIN_RESET_PASSWORD === "true") {
+        if (!ADMIN_PASSWORD) throw new Error("ADMIN_PASSWORD is required to reset the admin password.");
+        const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+        const { error } = await supabase.from("users").update({ password_hash: passwordHash }).eq("id", existing.id);
+        if (error) throw error;
+      }
+      return;
     }
+    if (!ADMIN_PASSWORD) {
+      console.error("Admin bootstrap skipped because ADMIN_PASSWORD is not configured.");
+      return;
+    }
+    const passwordHash = await bcrypt.hash(ADMIN_PASSWORD, 10);
+    const { error } = await supabase.from("users").insert({ username: ADMIN_USERNAME, email, is_admin: true, password_hash: passwordHash });
+    if (error) throw error;
   } catch (err) {
     console.error("ensureAdmin failed:", err.message);
   }
 }
 
 // ---------- helpers ----------
-function tokenFor(user) {
-  return jwt.sign({ sub: String(user.id) }, SECRET_KEY, { algorithm: "HS256", expiresIn: "2d" });
+function isValidUsername(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.-]{2,79}$/.test(value);
+}
+
+function isValidEmail(value) {
+  return typeof value === "string" && value.length <= 160 && /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(value);
+}
+
+function allowedPaymentMethods(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((method) => !["CARD", "COD"].includes(method))) return null;
+  return [...new Set(value)];
+}
+
+function tokenFor(user, role, expiresIn = "2d") {
+  return jwt.sign({ sub: String(user.id), role }, SECRET_KEY, { algorithm: "HS256", expiresIn });
 }
 
 async function currentUser(req) {
@@ -86,6 +121,8 @@ async function currentUser(req) {
   try {
     const claims = jwt.verify(header.slice(7), SECRET_KEY, { algorithms: ["HS256"] });
     const { data } = await supabase.from("users").select("*").eq("id", Number(claims.sub)).maybeSingle();
+    const expectedRole = data?.is_admin ? "admin" : "customer";
+    if (!data || claims.role !== expectedRole) return { user: null, error: { code: "INVALID_TOKEN", message: "Your session is invalid. Please sign in again." } };
     return { user: data || null, error: null };
   } catch (err) {
     if (err.name === "TokenExpiredError") return { user: null, error: { code: "TOKEN_EXPIRED", message: "Your session has expired. Please log in again." } };
@@ -124,7 +161,15 @@ function requestEventContext(req, user = null, address = null) {
 
 async function record(eventType, metadata = {}, userId = null, orderId = null, sessionId = null, context = {}) {
   const eventId = `evt_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
-  return supabase.from("transaction_events").insert({ event_id: eventId, event_type: eventType, metadata: { session_id: sessionId, device_id: null, account_id: userId == null ? null : String(userId), phone_hash: null, address_hash: null, ...context, ...metadata }, user_id: userId, order_id: orderId });
+  const stripRawContactFields = (value) => {
+    if (Array.isArray(value)) return value.map(stripRawContactFields);
+    if (!value || typeof value !== "object") return value;
+    return Object.fromEntries(Object.entries(value)
+      .filter(([key]) => !/^(phone|address|postal_?code|raw_phone|raw_address)$/i.test(key))
+      .map(([key, child]) => [key, stripRawContactFields(child)]));
+  };
+  const eventMetadata = stripRawContactFields({ session_id: sessionId, device_id: null, account_id: userId == null ? null : String(userId), phone_hash: null, address_hash: null, ...context, ...metadata });
+  return supabase.from("transaction_events").insert({ event_id: eventId, event_type: eventType, metadata: eventMetadata, user_id: userId, order_id: orderId });
 }
 
 async function isRulelockEnabled() {
@@ -239,10 +284,19 @@ function priceForSize(product, size) {
 }
 
 // naive in-memory rate limiter (per warm function instance only — see README)
-function rateLimit(maxHits, windowMs) {
+function clientIp(req) {
+  return req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function loginRateLimitKey(req) {
+  const identifier = String(req.body?.identifier || req.body?.email || req.body?.username || "").trim().toLowerCase().slice(0, 160);
+  return `${clientIp(req)}:${identifier || "<missing>"}`;
+}
+
+function rateLimit(maxHits, windowMs, keyForRequest = clientIp) {
   const hits = new Map();
   return (req, res, next) => {
-    const key = req.headers["x-nf-client-connection-ip"] || req.ip || "anon";
+    const key = keyForRequest(req);
     const now = Date.now();
     const entry = hits.get(key) || { count: 0, resetAt: now + windowMs };
     if (now > entry.resetAt) {
@@ -314,9 +368,11 @@ app.get("/coupons", async (_req, res) => {
       discountType: row.discount_type,
       discountValue: Number(row.discount_value),
       minimumOrder: Number(row.minimum_order),
-      freeDelivery: row.free_delivery || row.discount_type === "FREE_DELIVERY",
+      freeDelivery: row.free_delivery === true,
       canStack: row.can_stack,
       codApplicable: row.cod_applicable,
+      allowedPaymentMethods: row.allowed_payment_methods || [],
+      firstOrderOnly: row.first_order_only === true,
     })),
   });
 });
@@ -325,28 +381,51 @@ app.post("/auth/register", rateLimit(5, 60_000), async (req, res) => {
   const data = req.body || {};
   const username = String(data.username || "").trim();
   const email = String(data.email || "").trim().toLowerCase();
-  if (!username || !email || !data.password || String(data.password).length < 8) {
-    return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Use a username, email, and password of at least 8 characters." } });
+  if (!isValidUsername(username) || !isValidEmail(email) || !data.password || String(data.password).length < 8) {
+    return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Use a valid username, email, and password of at least 8 characters." } });
   }
-  const { data: existing } = await supabase.from("users").select("id").or(`email.eq.${email},username.eq.${username}`).maybeSingle();
-  if (existing) return res.status(409).json({ success: false, error: { code: "USER_EXISTS", message: "That account already exists." } });
+  const [{ data: existingEmail }, { data: existingUsername }] = await Promise.all([
+    supabase.from("users").select("id").eq("email", email).maybeSingle(),
+    supabase.from("users").select("id").eq("username", username).maybeSingle(),
+  ]);
+  if (existingEmail || existingUsername) return res.status(409).json({ success: false, error: { code: "USER_EXISTS", message: "That account already exists." } });
   const passwordHash = await bcrypt.hash(data.password, 10);
   const { data: user, error } = await supabase.from("users").insert({ username, email, password_hash: passwordHash }).select().single();
   if (error?.code === "23505") return res.status(409).json({ success: false, error: { code: "USER_EXISTS", message: "That username or email is already registered." } });
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
   await record("REGISTER", { email: user.email }, user.id, null, req.headers["x-session-id"] || null, requestEventContext(req, user));
-  res.status(201).json({ success: true, data: { token: tokenFor(user), user: { username: user.username, isAdmin: false } } });
+  res.status(201).json({ success: true, data: { token: tokenFor(user, "customer"), user: { username: user.username, isAdmin: false } } });
 });
 
-app.post("/auth/login", rateLimit(10, 60_000), async (req, res) => {
+app.post("/auth/login", rateLimit(10, 60_000, loginRateLimitKey), async (req, res) => {
   const data = req.body || {};
-  const identifier = data.identifier || data.email || data.username;
-  const { data: user } = await supabase.from("users").select("*").or(`email.eq.${identifier},username.eq.${identifier}`).maybeSingle();
+  const identifier = String(data.identifier || data.email || data.username || "").trim();
+  const emailLogin = identifier.includes("@");
+  if (emailLogin ? !isValidEmail(identifier) : !isValidUsername(identifier)) {
+    return res.status(400).json({ success: false, error: { code: "INVALID_IDENTIFIER", message: "Enter a valid email or username." } });
+  }
+  const { data: user } = await supabase.from("users").select("*").eq(emailLogin ? "email" : "username", emailLogin ? identifier.toLowerCase() : identifier).maybeSingle();
   if (!user || !(await bcrypt.compare(data.password || "", user.password_hash))) {
     return res.status(401).json({ success: false, error: { code: "INVALID_LOGIN", message: "Username/email or password is incorrect." } });
   }
+  if (user.is_admin) return res.status(403).json({ success: false, error: { code: "ADMIN_LOGIN_REQUIRED", message: "Administrators must use the administrator sign-in page." } });
   await record("LOGIN", { role: user.is_admin ? "admin" : "customer" }, user.id, null, req.headers["x-session-id"] || null, requestEventContext(req, user));
-  res.json({ success: true, data: { token: tokenFor(user), user: { username: user.username, isAdmin: user.is_admin } } });
+  res.json({ success: true, data: { token: tokenFor(user, "customer"), user: { username: user.username, isAdmin: false } } });
+});
+
+app.post("/auth/admin-login", rateLimit(10, 60_000, loginRateLimitKey), async (req, res) => {
+  const data = req.body || {};
+  const identifier = String(data.identifier || data.email || data.username || "").trim();
+  const emailLogin = identifier.includes("@");
+  if (emailLogin ? !isValidEmail(identifier) : !isValidUsername(identifier)) {
+    return res.status(400).json({ success: false, error: { code: "INVALID_IDENTIFIER", message: "Enter a valid email or username." } });
+  }
+  const { data: user } = await supabase.from("users").select("*").eq(emailLogin ? "email" : "username", emailLogin ? identifier.toLowerCase() : identifier).maybeSingle();
+  if (!user || !user.is_admin || !(await bcrypt.compare(data.password || "", user.password_hash))) {
+    return res.status(401).json({ success: false, error: { code: "INVALID_LOGIN", message: "Administrator username/email or password is incorrect." } });
+  }
+  await record("LOGIN", { role: "admin" }, user.id, null, req.headers["x-session-id"] || null, requestEventContext(req, user));
+  res.json({ success: true, data: { token: tokenFor(user, "admin", "8h"), user: { username: user.username, isAdmin: true } } });
 });
 
 app.get("/auth/me", async (req, res) => {
@@ -439,7 +518,7 @@ app.post("/checkout", async (req, res) => {
   let appliedCoupons = couponResult.accepted.map((coupon) => coupon.code);
   let freeDelivery = couponResult.freeDelivery;
   let delivery = fulfillmentMethod === "PICKUP" || freeDelivery ? 0 : 350;
-  const codFee = data.paymentMethod === "COD" && fulfillmentMethod === "DELIVERY" && !data.codPromotion ? 150 : 0;
+  const codFee = data.paymentMethod === "COD" && fulfillmentMethod === "DELIVERY" ? 150 : 0;
   let total = subtotal - discount + delivery + codFee;
   const address = fulfillmentMethod === "PICKUP"
     ? { fulfillmentMethod, label: "Self pickup", recipient: data.address?.name || "Customer", phone: data.address?.phone || "", pickupLocation: "Cakely Colombo" }
@@ -529,13 +608,19 @@ app.post("/checkout", async (req, res) => {
   const decision = rulelockResult.decision;
   const finalStatus = decision === "reject" ? "REJECTED" : decision === "hold" ? "PENDING_REVIEW" : "PENDING";
   const paymentStatus = decision === "reject" ? "VOIDED" : decision === "hold" ? "ON_HOLD" : data.paymentMethod === "CARD" ? "PAID" : "PENDING";
+  if ((decision === "accept" && !voidDiscount) || decision === "hold") {
+    const { error: usageError } = await recordUsage({ result: couponResult, userId: user.id, orderId: order.id, supabase });
+    if (usageError) {
+      const { error: cleanupError } = await supabase.from("orders").delete().eq("id", order.id);
+      if (cleanupError) console.error("Unable to remove order after coupon reservation failed:", cleanupError.message);
+      console.error("Unable to reserve coupon usage:", usageError.message);
+      return res.status(503).json({ success: false, error: { code: "COUPON_USAGE_UNAVAILABLE", message: "Coupon availability could not be confirmed. Please retry checkout." } });
+    }
+  }
   const { data: updatedOrder, error: updateError } = await supabase.from("orders").update({ status: finalStatus, payment_status: paymentStatus, discount, delivery_fee: delivery + codFee, total }).eq("id", order.id).select().single();
   if (updateError) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: updateError.message } });
   order = updatedOrder;
 
-  if ((decision === "accept" && !voidDiscount) || decision === "hold") {
-    await recordUsage({ result: couponResult, userId: user.id, orderId: order.id, supabase });
-  }
   if (rulelockOn) await record("RULELOCK_DECISION_APPLIED", { ...eventContext, order_id: order.id, decision, resulting_status: finalStatus }, user.id, order.id, sessionId);
 
   if (decision === "reject") return res.status(403).json({ customer_message: rulelockResult.customer_message });
@@ -774,6 +859,8 @@ app.post("/admin/coupons", async (req, res) => {
   const data = req.body || {};
   const code = String(data.code || "").trim().toUpperCase();
   if (!code) return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Coupon code is required." } });
+  const methods = allowedPaymentMethods(data.allowedPaymentMethods);
+  if (methods === null) return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Allowed payment methods must contain CARD or COD." } });
   const { data: row, error } = await supabase
     .from("coupons")
     .insert({
@@ -788,6 +875,7 @@ app.post("/admin/coupons", async (req, res) => {
       expires_at: data.expiresAt || null,
       can_stack: !!data.canStack,
       first_order_only: !!data.firstOrderOnly,
+      allowed_payment_methods: methods,
       free_delivery: !!data.freeDelivery,
       cod_applicable: data.codApplicable === undefined ? true : !!data.codApplicable,
       active: data.active === undefined ? true : !!data.active,
@@ -817,6 +905,13 @@ app.put("/admin/coupons/:id", async (req, res) => {
   if ("usageLimit" in data) updates.usage_limit = data.usageLimit;
   if ("perUserLimit" in data) updates.per_user_limit = data.perUserLimit;
   if ("expiresAt" in data) updates.expires_at = data.expiresAt;
+  if ("firstOrderOnly" in data) updates.first_order_only = !!data.firstOrderOnly;
+  if ("freeDelivery" in data) updates.free_delivery = !!data.freeDelivery;
+  if ("allowedPaymentMethods" in data) {
+    const methods = allowedPaymentMethods(data.allowedPaymentMethods);
+    if (methods === null) return res.status(400).json({ success: false, error: { code: "VALIDATION_ERROR", message: "Allowed payment methods must contain CARD or COD." } });
+    updates.allowed_payment_methods = methods;
+  }
   const { error } = await supabase.from("coupons").update(updates).eq("id", couponId);
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
   await record("ADMIN_COUPON_UPDATED", { couponId }, admin.id, null, req.headers["x-session-id"] || null, requestEventContext(req, admin));

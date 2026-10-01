@@ -4,14 +4,6 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { api, rotateSessionId, unwrap } from './services/api'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
-const percentageCodes = new Set(['CAKE10', 'CAKE20', 'CAKE30', 'CAKE50'])
-const couponRules = {
-  CAKE50: { methods: ['CARD'], label: 'Card only' },
-  CAKE30: { methods: ['COD'], label: 'Cash on delivery only' },
-  SAVE500: { methods: ['COD'], label: 'Cash on delivery only' },
-  FIRSTCAKE: { methods: ['CARD'], label: 'Card only' },
-  FREEDESSERT: { methods: ['COD'], label: 'Cash on delivery only' },
-}
 
 function DemoCardFields({ card, setCard }) {
   const change = (field, value) => setCard({ ...card, [field]: value })
@@ -62,18 +54,22 @@ export default function CheckoutRulesView({ cart, setCart }) {
   }, [navigate])
 
   useEffect(() => {
-    setSelected((current) => current.filter((code) => !couponRules[code] || couponRules[code].methods.includes(form.paymentMethod)))
-  }, [form.paymentMethod])
+    setSelected((current) => current.filter((code) => {
+      const allowedMethods = coupons.find((coupon) => coupon.code === code)?.allowedPaymentMethods || []
+      return !allowedMethods.length || allowedMethods.includes(form.paymentMethod)
+    }))
+  }, [form.paymentMethod, coupons])
 
+  const isPercentage = (coupon) => coupon.discountType === 'PERCENTAGE'
   const isDisabled = (coupon) => {
-    const rule = couponRules[coupon.code]
-    if (rule && !rule.methods.includes(form.paymentMethod)) return true
-    return !selected.includes(coupon.code) && percentageCodes.has(coupon.code) && selected.some((code) => percentageCodes.has(code))
+    const allowedMethods = coupon.allowedPaymentMethods || []
+    if (allowedMethods.length && !allowedMethods.includes(form.paymentMethod)) return true
+    return !selected.includes(coupon.code) && isPercentage(coupon) && selectedCoupons.some((item) => isPercentage(item))
   }
   const disabledReason = (coupon) => {
-    const rule = couponRules[coupon.code]
-    if (rule && !rule.methods.includes(form.paymentMethod)) return rule.label
-    if (percentageCodes.has(coupon.code) && selected.some((code) => percentageCodes.has(code))) return 'Only one percentage coupon'
+    const allowedMethods = coupon.allowedPaymentMethods || []
+    if (allowedMethods.length && !allowedMethods.includes(form.paymentMethod)) return `${allowedMethods.join(' or ')} only`
+    if (isPercentage(coupon) && selectedCoupons.some((item) => isPercentage(item))) return 'Only one percentage coupon'
     return ''
   }
   const toggleCoupon = (coupon) => {
@@ -89,7 +85,7 @@ export default function CheckoutRulesView({ cart, setCart }) {
     setError('')
     try {
       const address = isPickup ? { name: form.name, phone: form.phone, fulfillmentMethod: 'PICKUP' } : { ...form, fulfillmentMethod: 'DELIVERY' }
-      const result = await unwrap(api.post('/checkout', { items: checkoutCart, address, fulfillmentMethod: form.fulfillmentMethod, paymentMethod: form.paymentMethod, coupons: selected, discount: estimatedDiscount, freeDelivery }))
+      const result = await unwrap(api.post('/checkout', { items: checkoutCart, address, fulfillmentMethod: form.fulfillmentMethod, paymentMethod: form.paymentMethod, coupons: selected, discount: estimatedDiscount }))
       setCart([])
       rotateSessionId()
       navigate('/account', { state: { order: result.data } })

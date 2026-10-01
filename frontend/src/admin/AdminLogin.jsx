@@ -12,7 +12,7 @@ export default function AdminLogin() {
     event.preventDefault()
     setError('')
     try {
-      const result = await unwrap(api.post('/auth/login', { identifier, password }))
+      const result = await unwrap(api.post('/auth/admin-login', { identifier, password }))
       if (!result.data.user.isAdmin) throw new Error('Administrator access required.')
       localStorage.setItem('cakely_token', result.data.token)
       rotateSessionId()

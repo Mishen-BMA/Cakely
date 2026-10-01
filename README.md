@@ -38,8 +38,8 @@ npm install
 npm run seed
 ```
 
-This creates the admin login (`ADMIN_USERNAME` / `ADMIN_PASSWORD`, default
-`admin` / `admin123`), nine starter products with placeholder images (swap
+This creates the admin login (`ADMIN_USERNAME` / `ADMIN_PASSWORD`; set both
+before seeding), eight starter products with placeholder images (swap
 them for real photos from the admin panel after deploying), and the sample
 coupon codes (`CAKE10`, `CAKE20`, `SAVE500`, etc.).
 
@@ -133,10 +133,10 @@ need server-side rewrite rules.
   container, so it resets on cold starts and isn't shared across concurrent
   instances. Good enough for a coursework-scale demo; not a substitute for
   a real distributed rate limiter in production.
-- **Admin bootstrap** runs once per cold start (not once ever) — matching
-  the original Flask behavior of re-syncing the admin password from
-  `ADMIN_PASSWORD` on every startup. If you change `ADMIN_PASSWORD` in
-  Netlify's env vars, it takes effect the next time the function cold-starts.
+- **Admin bootstrap** creates the configured administrator only when that
+  account is missing. Existing passwords remain unchanged unless
+  `ADMIN_RESET_PASSWORD=true` is explicitly configured. Production startup
+  requires both `JWT_SECRET_KEY` and `ADMIN_PASSWORD`.
 - **Security mode:** keep `CAKELY_SECURITY_MODE=normal` in production.
   `research` mode intentionally disables coupon-stacking protection and
   exists only for demonstrating the vulnerability in a controlled way.

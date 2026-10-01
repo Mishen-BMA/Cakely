@@ -1,12 +1,3 @@
-const PAYMENT_RULES = {
-  CAKE50: new Set(["CARD"]),
-  CAKE30: new Set(["COD"]),
-  SAVE500: new Set(["COD"]),
-  FIRSTCAKE: new Set(["CARD"]),
-  FREEDESSERT: new Set(["COD"]),
-};
-const PERCENTAGE_CODES = new Set(["CAKE10", "CAKE20", "CAKE30", "CAKE50"]);
-
 function round2(value) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
@@ -30,6 +21,17 @@ async function validateCoupons({ codes, subtotal, user, paymentMethod, securityM
       result.rejected.push({ code, reason: "Coupon is inactive or unknown" });
       continue;
     }
+    if (coupon.first_order_only && user) {
+      const { data: priorOrders, error } = await supabase.from("orders").select("id,status").eq("user_id", user.id);
+      if (error) {
+        result.rejected.push({ code, reason: "Unable to verify first order eligibility" });
+        continue;
+      }
+      if ((priorOrders || []).some((order) => !["CANCELLED", "REJECTED"].includes(order.status))) {
+        result.rejected.push({ code, reason: "Coupon is for first orders only" });
+        continue;
+      }
+    }
     const now = new Date();
     if (coupon.expires_at && new Date(coupon.expires_at) < now) {
       result.rejected.push({ code, reason: "Coupon expired" });
@@ -39,15 +41,12 @@ async function validateCoupons({ codes, subtotal, user, paymentMethod, securityM
       result.rejected.push({ code, reason: "Minimum order value not met" });
       continue;
     }
-    if (paymentMethod === "COD" && !coupon.cod_applicable) {
-      result.rejected.push({ code, reason: "Coupon is not valid for COD" });
+    const allowedMethods = Array.isArray(coupon.allowed_payment_methods) ? coupon.allowed_payment_methods : [];
+    if (allowedMethods.length && !allowedMethods.includes(paymentMethod)) {
+      result.rejected.push({ code, reason: `Coupon is not valid for ${paymentMethod}` });
       continue;
     }
-    if (PAYMENT_RULES[code] && !PAYMENT_RULES[code].has(paymentMethod)) {
-      result.rejected.push({ code, reason: `Coupon is for ${[...PAYMENT_RULES[code]][0]} only` });
-      continue;
-    }
-    if (PERCENTAGE_CODES.has(code) && result.accepted.some((item) => PERCENTAGE_CODES.has(item.code))) {
+    if (coupon.discount_type === "PERCENTAGE" && result.accepted.some((item) => item.discountType === "PERCENTAGE")) {
       result.rejected.push({ code, reason: "Only one percentage coupon can be used" });
       continue;
     }
@@ -65,40 +64,35 @@ async function validateCoupons({ codes, subtotal, user, paymentMethod, securityM
         continue;
       }
     }
-    if (result.accepted.length && (!coupon.can_stack || result.accepted.some((item) => !item.canStack))) {
+    if (securityMode !== "research" && result.accepted.length && (!coupon.can_stack || result.accepted.some((item) => !item.canStack))) {
       result.rejected.push({ code, reason: "Coupon cannot be stacked" });
       continue;
     }
 
     let value;
+    if (coupon.free_delivery) result.freeDelivery = true;
     if (coupon.discount_type === "PERCENTAGE") {
       value = (subtotal * Number(coupon.discount_value)) / 100;
       if (coupon.max_discount != null) value = Math.min(value, Number(coupon.max_discount));
     } else if (coupon.discount_type === "FIXED") {
       value = Number(coupon.discount_value);
+    } else if (coupon.discount_type === "FREE_DELIVERY") {
+      value = 0;
     } else {
       value = 0;
-      result.freeDelivery = true;
     }
     result.discount = Math.min(subtotal, result.discount + value);
-    result.accepted.push({ code, discount: round2(value), canStack: coupon.can_stack });
+    result.accepted.push({ id: coupon.id, code, discount: round2(value), canStack: coupon.can_stack, discountType: coupon.discount_type });
   }
 
-  if (securityMode === "research" && normalized.length > 1) {
-    result.accepted = normalized.map((code) => ({ code, discount: 0, canStack: true }));
-    result.rejected = [];
-  }
   result.discount = round2(result.discount);
   return result;
 }
 
 async function recordUsage({ result, userId, orderId, supabase }) {
-  for (const accepted of result.accepted) {
-    const { data: coupon } = await supabase.from("coupons").select("id").eq("code", accepted.code).maybeSingle();
-    if (coupon) {
-      await supabase.from("coupon_usages").insert({ coupon_id: coupon.id, user_id: userId, order_id: orderId });
-    }
-  }
+  const couponIds = [...new Set((result.accepted || []).map((coupon) => coupon.id).filter(Boolean))];
+  if (!couponIds.length) return { error: null };
+  return supabase.rpc("record_coupon_usages", { p_coupon_ids: couponIds, p_user_id: userId, p_order_id: orderId });
 }
 
 module.exports = { validateCoupons, recordUsage };

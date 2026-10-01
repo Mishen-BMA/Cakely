@@ -190,7 +190,7 @@ function Login() {
     event.preventDefault()
     setError('')
     try {
-      const result = await unwrap(api.post('/auth/login', {
+      const result = await unwrap(api.post(isAdmin ? '/auth/admin-login' : '/auth/login', {
         identifier: form.identifier,
         password: form.password,
       }))

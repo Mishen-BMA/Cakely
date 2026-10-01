@@ -103,7 +103,7 @@ function Dashboard({ data, onNavigate }) {
 }
 
 const emptyProduct = { name: '', slug: '', description: '', category: 'Classic cakes', basePrice: '', flavours: 'Vanilla, Chocolate', sizes: '{"1 kg": 0}', active: true }
-const emptyCoupon = { code: '', description: '', discountType: 'PERCENTAGE', discountValue: '', minimumOrder: 0, usageLimit: '', perUserLimit: '', expiresAt: '', active: true }
+const emptyCoupon = { code: '', description: '', discountType: 'PERCENTAGE', discountValue: '', minimumOrder: 0, usageLimit: '', perUserLimit: '', expiresAt: '', allowedPaymentMethods: [], firstOrderOnly: false, freeDelivery: false, active: true }
 
 function ProductForm({ product, onClose, onSaved }) {
   const [form, setForm] = useState(product ? { ...product, flavours: (product.flavours || []).join(', '), sizes: JSON.stringify(product.sizes || {}) } : emptyProduct)
@@ -238,9 +238,9 @@ function Customers({ customers }) {
 }
 
 function CouponForm({ coupon, onClose, onSaved }) {
-  const [form, setForm] = useState(coupon ? { ...coupon } : emptyCoupon)
+  const [form, setForm] = useState(coupon ? { ...emptyCoupon, ...coupon } : emptyCoupon)
   const save = async (event) => { event.preventDefault(); await unwrap(coupon ? api.put(`/admin/coupons/${coupon.id}`, form) : api.post('/admin/coupons', form)); onSaved(); onClose() }
-  return <div className="admin-modal"><form className="admin-editor" onSubmit={save}><div className="admin-card-head"><h2>{coupon ? 'Edit coupon' : 'New coupon'}</h2><button type="button" className="admin-icon-button" onClick={onClose}><X size={18}/></button></div>{[['code','Code'],['description','Description'],['discountValue','Discount value'],['minimumOrder','Minimum order'],['usageLimit','Usage limit'],['perUserLimit','Per-user limit'],['expiresAt','Expires at']].map(([key,label]) => <label key={key}>{label}<input value={form[key] ?? ''} onChange={(e) => setForm({ ...form, [key]: e.target.value })}/></label>)}<label>Type<select value={form.discountType} onChange={(e) => setForm({ ...form, discountType: e.target.value })}><option>PERCENTAGE</option><option>FIXED</option><option>FREE_DELIVERY</option></select></label><button className="button primary">Save coupon <Tag size={16}/></button></form></div>
+  return <div className="admin-modal"><form className="admin-editor" onSubmit={save}><div className="admin-card-head"><h2>{coupon ? 'Edit coupon' : 'New coupon'}</h2><button type="button" className="admin-icon-button" onClick={onClose}><X size={18}/></button></div>{[['code','Code'],['description','Description'],['discountValue','Discount value'],['minimumOrder','Minimum order'],['usageLimit','Usage limit'],['perUserLimit','Per-user limit'],['expiresAt','Expires at']].map(([key,label]) => <label key={key}>{label}<input value={form[key] ?? ''} onChange={(e) => setForm({ ...form, [key]: e.target.value })}/></label>)}<label>Type<select value={form.discountType} onChange={(e) => setForm({ ...form, discountType: e.target.value })}><option>PERCENTAGE</option><option>FIXED</option><option>FREE_DELIVERY</option></select></label><fieldset><legend>Allowed payment methods (empty means all)</legend>{['CARD','COD'].map((method) => <label key={method}><input type="checkbox" checked={(form.allowedPaymentMethods || []).includes(method)} onChange={(event) => setForm({ ...form, allowedPaymentMethods: event.target.checked ? [...(form.allowedPaymentMethods || []), method] : (form.allowedPaymentMethods || []).filter((item) => item !== method) })}/>{method}</label>)}</fieldset><label><input type="checkbox" checked={Boolean(form.firstOrderOnly)} onChange={(event) => setForm({ ...form, firstOrderOnly: event.target.checked })}/> First order only</label><label><input type="checkbox" checked={Boolean(form.freeDelivery)} onChange={(event) => setForm({ ...form, freeDelivery: event.target.checked })}/> Free delivery</label><button className="button primary">Save coupon <Tag size={16}/></button></form></div>
 }
 
 function Coupons({ coupons, reload }) {

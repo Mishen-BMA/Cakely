@@ -1,5 +1,5 @@
 // One-time seed script. Run locally with your env vars set:
-//   SUPABASE_URL=... SUPABASE_SECRET_KEY=... ADMIN_USERNAME=admin ADMIN_PASSWORD=admin123 node scripts/seed.mjs
+//   SUPABASE_URL=... SUPABASE_SECRET_KEY=... ADMIN_USERNAME=admin ADMIN_PASSWORD=<configured-password> node scripts/seed.mjs
 // or `npm run seed` from the repo root after copying .env.example to .env and filling it in.
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
@@ -29,29 +29,44 @@ const SIZE_MULTIPLIERS = { "1 kg": 1, "2 kg": 2, "3 kg": 3, "5 kg": 5, "7 kg": 7
 const FLAVOURS = ["Vanilla", "Chocolate", "Coffee", "Fruit", "Butterscotch", "Coconut"];
 
 const COUPONS = [
-  ["CAKE10", "10% off your cake order", "PERCENTAGE", 10, 0],
-  ["CAKE20", "20% off your cake order", "PERCENTAGE", 20, 0],
-  ["CAKE30", "30% off your cake order", "PERCENTAGE", 30, 0],
-  ["CAKE50", "50% off your cake order", "PERCENTAGE", 50, 0],
-  ["SAVE500", "Rs. 500 off orders over Rs. 2500", "FIXED", 500, 2500],
-  ["FIRSTCAKE", "Rs. 1000 off a first order", "FIXED", 1000, 3000],
-  ["FREEDESSERT", "Free delivery for demonstrations", "FREE_DELIVERY", 0, 0],
+  ["CAKE10", "10% off your cake order", "PERCENTAGE", 10, 0, ["CARD", "COD"], false, null, false],
+  ["CAKE20", "20% off your cake order", "PERCENTAGE", 20, 0, ["CARD", "COD"], false, null, false],
+  ["CAKE30", "30% off your cake order", "PERCENTAGE", 30, 0, ["COD"], false, null, false],
+  ["CAKE50", "50% off your cake order", "PERCENTAGE", 50, 0, ["CARD"], false, null, false],
+  ["SAVE500", "Rs. 500 off orders over Rs. 2500", "FIXED", 500, 2500, ["COD"], false, null, false],
+  ["FIRSTCAKE", "Rs. 1000 off a first order", "FIXED", 1000, 3000, ["CARD"], true, 1, false],
+  ["FREEDESSERT", "Free delivery for demonstrations", "FREE_DELIVERY", 0, 0, ["COD"], false, null, true],
 ];
 
 async function seedAdmin() {
   const username = process.env.ADMIN_USERNAME || "admin";
-  const password = process.env.ADMIN_PASSWORD || "admin123";
-  const passwordHash = await bcrypt.hash(password, 10);
-  const email = `${username}@cakely.lk`;
-
-  const { data: existing } = await supabase.from("users").select("id").or(`username.eq.${username},email.eq.${email}`).maybeSingle();
-  if (existing) {
-    await supabase.from("users").update({ username, email, is_admin: true, password_hash: passwordHash }).eq("id", existing.id);
-    console.log(`Admin user updated (${username}).`);
-  } else {
-    await supabase.from("users").insert({ username, email, is_admin: true, password_hash: passwordHash });
-    console.log(`Admin user created (${username}).`);
+  const password = process.env.ADMIN_PASSWORD;
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{2,79}$/.test(username) || !password) {
+    throw new Error("Configure a valid ADMIN_USERNAME and ADMIN_PASSWORD before seeding the admin account.");
   }
+  const email = `${username}@cakely.lk`;
+  const [{ data: byUsername }, { data: byEmail }] = await Promise.all([
+    supabase.from("users").select("*").eq("username", username).maybeSingle(),
+    supabase.from("users").select("*").eq("email", email).maybeSingle(),
+  ]);
+  if (byUsername && byEmail && byUsername.id !== byEmail.id) throw new Error("Configured admin username and email belong to different accounts.");
+  const existing = byUsername || byEmail;
+  if (existing) {
+    if (!existing.is_admin) throw new Error("Configured admin identity belongs to a non-admin account.");
+    if (process.env.ADMIN_RESET_PASSWORD === "true") {
+      const passwordHash = await bcrypt.hash(password, 10);
+      const { error } = await supabase.from("users").update({ password_hash: passwordHash }).eq("id", existing.id);
+      if (error) throw error;
+      console.log(`Admin password reset (${username}).`);
+    } else {
+      console.log(`Admin account already exists (${username}); password left unchanged.`);
+    }
+    return;
+  }
+  const passwordHash = await bcrypt.hash(password, 10);
+  const { error } = await supabase.from("users").insert({ username, email, is_admin: true, password_hash: passwordHash });
+  if (error) throw error;
+  console.log(`Admin user created (${username}).`);
 }
 
 async function seedProducts() {
@@ -77,10 +92,10 @@ async function seedProducts() {
 }
 
 async function seedCoupons() {
-  for (const [code, description, discount_type, discount_value, minimum_order] of COUPONS) {
+  for (const [code, description, discount_type, discount_value, minimum_order, allowed_payment_methods, first_order_only, per_user_limit, free_delivery] of COUPONS) {
     const { data: existing } = await supabase.from("coupons").select("id").eq("code", code).maybeSingle();
     if (existing) continue;
-    await supabase.from("coupons").insert({ code, description, discount_type, discount_value, minimum_order, can_stack: false, active: true });
+    await supabase.from("coupons").insert({ code, description, discount_type, discount_value, minimum_order, allowed_payment_methods, first_order_only, per_user_limit, free_delivery, cod_applicable: allowed_payment_methods.includes("COD"), can_stack: false, active: true });
   }
   console.log("Coupons seeded.");
 }

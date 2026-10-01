@@ -1,6 +1,7 @@
 ﻿import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import request from 'supertest'
 import jwt from 'jsonwebtoken'
+import bcrypt from 'bcryptjs'
 import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
@@ -10,19 +11,26 @@ const admin = { id: 1, username: 'admin', is_admin: true }
 const product = { id: 12, name: 'Cake', active: true, base_price: 1000, flavours: ['Vanilla'], sizes: { '1 kg': 1000 } }
 
 function makeDatabase() {
-  const state = { orders: [], events: [], couponUsages: [], user: { ...user }, enabled: true, nextOrderId: 20 }
+  const state = { orders: [], events: [], couponUsages: [], user: { ...user, password_hash: null }, admin: { ...admin, email: 'admin@cakely.lk', password_hash: null }, enabled: true, nextOrderId: 20, rpcCalls: [], firstOrderOnly: false }
   const resolve = (query) => {
     const { table, operation, payload, filters } = query
     const match = (row) => filters.every(([key, value, mode]) => mode === 'neq' ? row?.[key] !== value : mode === 'or' ? true : String(row?.[key]) === String(value))
     if (table === 'users') {
       if (operation === 'select') {
-        if (filters.some(([key]) => key === 'or')) return { data: admin, error: null }
-        return { data: filters.some(([key]) => key === 'id') ? state.user : null, error: null }
+        const idFilter = filters.find(([key]) => key === 'id')
+        if (idFilter) return { data: String(idFilter[1]) === String(state.admin.id) ? state.admin : String(idFilter[1]) === String(state.user.id) ? state.user : null, error: null }
+        const identity = filters.find(([key]) => key === 'username' || key === 'email')
+        if (identity) {
+          const [key, value] = identity
+          return { data: String(state.admin[key]).toLowerCase() === String(value).toLowerCase() ? state.admin : String(state.user[key]).toLowerCase() === String(value).toLowerCase() ? state.user : null, error: null }
+        }
+        return { data: null, error: null }
       }
       if (operation === 'update') {
-        if (String(filters.find(([key]) => key === 'id')?.[1]) === String(admin.id)) return { data: admin, error: null }
+        if (String(filters.find(([key]) => key === 'id')?.[1]) === String(state.admin.id)) { Object.assign(state.admin, payload); return { data: state.admin, error: null } }
         state.user = { ...state.user, ...payload }; return { data: state.user, error: null }
       }
+      if (operation === 'insert') { state.registeredUser = payload; return { data: { ...payload, id: 9 }, error: null } }
       return { data: null, error: null }
     }
     if (table === 'products') return { data: product, error: null }
@@ -32,7 +40,8 @@ function makeDatabase() {
     }
     if (table === 'coupons') {
       const code = filters.find(([key]) => key === 'code')?.[1]
-      return { data: code === 'SAVE500' ? { id: 3, code: 'SAVE500', active: true, discount_type: 'FIXED', discount_value: 500, minimum_order: 0, can_stack: false, cod_applicable: true } : null, error: null }
+      if (!['SAVE500', 'FREEDESSERT'].includes(code)) return { data: null, error: null }
+      return { data: { id: code === 'SAVE500' ? 3 : 4, code, active: true, discount_type: code === 'FREEDESSERT' ? 'FIXED' : 'FIXED', discount_value: code === 'SAVE500' ? 500 : 0, minimum_order: 0, can_stack: false, allowed_payment_methods: ['COD'], free_delivery: code === 'FREEDESSERT', first_order_only: state.firstOrderOnly } , error: null }
     }
     if (table === 'coupon_usages') {
       if (operation === 'insert') { state.couponUsages.push(payload); return { data: payload, error: null } }
@@ -58,7 +67,14 @@ function makeDatabase() {
     }
     return { data: null, error: null }
   }
-  const client = { from(table) {
+  const client = { rpc(name, args) {
+    state.rpcCalls.push([name, args])
+    if (name === 'record_coupon_usages') {
+      for (const coupon_id of args.p_coupon_ids) state.couponUsages.push({ coupon_id, user_id: args.p_user_id, order_id: args.p_order_id })
+      return Promise.resolve({ data: null, error: null })
+    }
+    return Promise.resolve({ data: null, error: { message: 'Unknown RPC' } })
+  }, from(table) {
     const query = { table, operation: 'select', filters: [], payload: null }
     const chain = {
       select() { return chain },
@@ -68,7 +84,6 @@ function makeDatabase() {
       delete() { query.operation = 'delete'; return chain },
       eq(key, value) { query.filters.push([key, value]); return chain },
       neq(key, value) { query.filters.push([key, value, 'neq']); return chain },
-      or(value) { query.filters.push(['or', value, 'or']); return chain },
       order() { return chain },
       limit() { return chain },
       single() { return Promise.resolve(resolve(query)) },
@@ -85,14 +100,19 @@ let app
 let token
 
 beforeEach(() => {
+  vi.stubEnv('JWT_SECRET_KEY', 'unit-test-jwt-secret')
+  vi.stubEnv('ADMIN_USERNAME', 'admin')
+  vi.stubEnv('ADMIN_PASSWORD', 'admin-password')
   vi.stubEnv('RULELOCK_API_URL', 'https://rulelock.example')
   vi.stubEnv('RULELOCK_API_TOKEN', 'test-token')
   
   db = makeDatabase()
+  db.state.admin.password_hash = bcrypt.hashSync('admin-password', 4)
+  db.state.user.password_hash = bcrypt.hashSync('customer-password', 4)
   globalThis.__CAKELY_SUPABASE_CLIENT__ = db.client
   delete require.cache[apiPath]
   app = require('../api.js').app
-  token = jwt.sign({ sub: String(user.id) }, 'dev-only-change-me', { algorithm: 'HS256' })
+  token = jwt.sign({ sub: String(user.id), role: 'customer' }, 'unit-test-jwt-secret', { algorithm: 'HS256' })
   vi.stubGlobal('fetch', vi.fn())
 })
 
@@ -103,7 +123,7 @@ afterEach(() => {
 })
 
 const checkout = (extra = {}) => request(app).post('/checkout')
-  .set('Authorization', `Bearer ${jwt.sign({ sub: String(user.id) }, 'dev-only-change-me')}`)
+  .set('Authorization', `Bearer ${jwt.sign({ sub: String(user.id), role: 'customer' }, 'unit-test-jwt-secret')}`)
   .set('X-Session-ID', 'session-test')
   .set('X-Device-ID', 'device-test')
   .send({ items: [{ productId: 12, size: '1 kg', quantity: 1 }], address: { name: 'Casey', phone: '+94 77 123 4567', address: '12 Cake Street', city: 'Colombo', district: 'Colombo' }, paymentMethod: 'CARD', fulfillmentMethod: 'DELIVERY', coupons: [], ...extra })
@@ -208,27 +228,67 @@ describe('RuleLock checkout contract', () => {
   })
 
   it('supports COD refused status and records release overrides', async () => {
-    db.state.user = { ...db.state.user, is_admin: true }
     db.state.orders.push({ id: 42, user_id: 7, payment_method: 'COD', status: 'PENDING_REVIEW', payment_status: 'ON_HOLD' })
-    const authorization = `Bearer ${jwt.sign({ sub: '7' }, 'dev-only-change-me')}`
+    const authorization = `Bearer ${jwt.sign({ sub: '1', role: 'admin' }, 'unit-test-jwt-secret')}`
     await request(app).patch('/admin/orders/42').set('Authorization', authorization).send({ action: 'release' }).expect(200)
     expect(db.state.orders.find((order) => order.id === 42).status).toBe('PENDING')
     const override = db.state.events.find((event) => event.event_type === 'RULELOCK_OVERRIDE')
-    expect(override.metadata).toMatchObject({ order_id: 42, action: 'release', admin_id: 7, previous_decision: 'hold' })
+    expect(override.metadata).toMatchObject({ order_id: 42, action: 'release', admin_id: 1, previous_decision: 'hold' })
     await request(app).patch('/admin/orders/42').set('Authorization', authorization).send({ status: 'REFUSED' }).expect(200)
     expect(db.state.orders.find((order) => order.id === 42).status).toBe('REFUSED')
   })
 
   it('stores the RuleLock toggle in platform_settings and progresses pending orders', async () => {
-    db.state.user = { ...db.state.user, is_admin: true }
     db.state.orders.push({ id: 52, user_id: 7, payment_method: 'CARD', status: 'PENDING', payment_status: 'PAID' })
-    const authorization = `Bearer ${jwt.sign({ sub: '7' }, 'dev-only-change-me')}`
+    const authorization = `Bearer ${jwt.sign({ sub: '1', role: 'admin' }, 'unit-test-jwt-secret')}`
     await request(app).patch('/admin/rulelock').set('Authorization', authorization).send({ enabled: false }).expect(200)
     expect(db.state.enabled).toBe(false)
     expect(db.state.events.some((event) => event.event_type === 'RULELOCK_SETTING_CHANGED')).toBe(false)
     await request(app).patch('/admin/orders/52').set('Authorization', authorization).send({ status: 'PREPARING' }).expect(200)
     await request(app).patch('/admin/orders/52').set('Authorization', authorization).send({ status: 'COMPLETED' }).expect(200)
     expect(db.state.orders.find((order) => order.id === 52).status).toBe('COMPLETED')
+  })
+
+  it('ignores client COD promotion claims and calculates fees on the server', async () => {
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout({ paymentMethod: 'COD', codPromotion: true }).expect(201)
+    expect(db.state.orders[0]).toMatchObject({ delivery_fee: 500, total: 1500 })
+  })
+
+  it('enforces first-order coupons based on prior order status', async () => {
+    db.state.firstOrderOnly = true
+    db.state.orders.push({ id: 4, user_id: 7, status: 'CANCELLED' }, { id: 5, user_id: 7, status: 'REJECTED' })
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout({ paymentMethod: 'COD', coupons: ['SAVE500'] }).expect(201)
+    expect(db.state.orders.at(-1).discount).toBe(500)
+    expect(db.state.couponUsages).toHaveLength(1)
+
+    db.state.orders.push({ id: 6, user_id: 7, status: 'COMPLETED' })
+    await checkout({ paymentMethod: 'COD', coupons: ['SAVE500'] }).expect(201)
+    expect(db.state.orders.at(-1).discount).toBe(0)
+    expect(db.state.couponUsages).toHaveLength(1)
+  })
+
+  it('honors database free_delivery independently of discount type', async () => {
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout({ paymentMethod: 'COD', coupons: ['FREEDESSERT'] }).expect(201)
+    expect(db.state.orders[0]).toMatchObject({ discount: 0, delivery_fee: 150, total: 1150 })
+  })
+
+  it('keeps customer and administrator authentication roles separate', async () => {
+    const customerLogin = await request(app).post('/auth/login').send({ identifier: 'customer', password: 'customer-password' }).expect(200)
+    expect(jwt.decode(customerLogin.body.data.token).role).toBe('customer')
+    await request(app).post('/auth/login').send({ identifier: 'admin', password: 'admin-password' }).expect(403)
+    const adminLogin = await request(app).post('/auth/admin-login').send({ identifier: 'admin', password: 'admin-password' }).expect(200)
+    const adminClaims = jwt.decode(adminLogin.body.data.token)
+    expect(adminClaims.role).toBe('admin')
+    expect(adminClaims.exp - adminClaims.iat).toBe(8 * 60 * 60)
+    await request(app).post('/auth/admin-login').send({ identifier: 'customer', password: 'customer-password' }).expect(401)
+  })
+
+  it('validates identifiers before querying authentication records', async () => {
+    await request(app).post('/auth/login').send({ identifier: 'x",email.eq.admin@example.test', password: 'anything' }).expect(400)
+    await request(app).post('/auth/register').send({ username: 'x",or(id.gt.0)', email: 'not-an-email', password: 'long-enough-password' }).expect(400)
   })
 })
 
