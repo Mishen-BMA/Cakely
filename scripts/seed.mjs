@@ -85,10 +85,17 @@ async function seedCoupons() {
   console.log("Coupons seeded.");
 }
 
+async function seedPlatformSettings() {
+  const { error } = await supabase.from("platform_settings").upsert({ id: 1, rulelock_enabled: false }, { onConflict: "id", ignoreDuplicates: true });
+  if (error) throw error;
+  console.log("Platform settings seeded.");
+}
+
 async function main() {
   await seedAdmin();
   await seedProducts();
   await seedCoupons();
+  await seedPlatformSettings();
   console.log("Cakely seed complete.");
 }
 
