@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ArrowRight, Check, CreditCard, MapPin, Tag } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { api, unwrap } from './services/api'
+import { api, rotateSessionId, unwrap } from './services/api'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
 const percentageCodes = new Set(['CAKE10', 'CAKE20', 'CAKE30', 'CAKE50'])
@@ -50,6 +50,7 @@ export default function CheckoutRulesView({ cart, setCart }) {
   const total = Math.max(0, subtotal - estimatedDiscount + deliveryFee + codFee)
 
   useEffect(() => {
+    api.get('/rulelock/warm').catch(() => {})
     Promise.all([unwrap(api.get('/auth/me')), unwrap(api.get('/coupons')), unwrap(api.get('/addresses'))])
       .then(([, couponData, addressData]) => {
         setCoupons(Array.isArray(couponData.data) ? couponData.data : [])
@@ -90,9 +91,10 @@ export default function CheckoutRulesView({ cart, setCart }) {
       const address = isPickup ? { name: form.name, phone: form.phone, fulfillmentMethod: 'PICKUP' } : { ...form, fulfillmentMethod: 'DELIVERY' }
       const result = await unwrap(api.post('/checkout', { items: checkoutCart, address, fulfillmentMethod: form.fulfillmentMethod, paymentMethod: form.paymentMethod, coupons: selected, discount: estimatedDiscount, freeDelivery }))
       setCart([])
+      rotateSessionId()
       navigate('/account', { state: { order: result.data } })
     } catch (err) {
-      setError(err.response?.data?.error?.message || 'Unable to place your order.')
+      setError(err.response?.data?.customer_message || err.response?.data?.error?.message || 'Unable to place your order.')
     }
   }
 

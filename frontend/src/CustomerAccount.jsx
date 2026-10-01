@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ArrowLeft, CircleUserRound, Home, LogOut, Package, ShieldCheck, Trash2 } from 'lucide-react'
 import { Link, useNavigate } from 'react-router-dom'
-import { api, unwrap } from './services/api'
+import { api, rotateSessionId, unwrap } from './services/api'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
 const blankAddress = { label: 'Home', recipient: '', phone: '', address: '', city: 'Colombo', district: 'Colombo', postalCode: '', isDefault: false }
@@ -19,7 +19,7 @@ export default function CustomerAccount() {
       setOrders(Array.isArray(orderData.data) ? orderData.data : [])
       setAddresses(Array.isArray(addressData.data) ? addressData.data : [])
     })
-    .catch(() => { localStorage.removeItem('cakely_token'); navigate('/login') })
+    .catch(() => { localStorage.removeItem('cakely_token'); rotateSessionId(); navigate('/login') })
 
   useEffect(() => {
     load()
@@ -33,7 +33,7 @@ export default function CustomerAccount() {
     try { await unwrap(api.post('/addresses', addressForm)); setAddressForm(blankAddress); await load() } catch (err) { setAddressError(err.response?.data?.error?.message || 'Unable to save address.') }
   }
   const removeAddress = async (id) => { await unwrap(api.delete(`/addresses/${id}`)); setAddresses((current) => current.filter((address) => address.id !== id)) }
-  const logout = () => { localStorage.removeItem('cakely_token'); navigate('/login') }
+  const logout = () => { localStorage.removeItem('cakely_token'); rotateSessionId(); navigate('/login') }
 
   if (!profile) return <main className="page narrow"><div className="empty"><p>Loading your account...</p></div></main>
 
@@ -46,6 +46,7 @@ export default function CustomerAccount() {
       <section className="account-profile"><CircleUserRound size={30}/><p className="eyebrow">Profile</p><h2>{profile.username}</h2><p>{profile.email}</p><span><ShieldCheck size={14}/> Customer account</span></section>
       <section className="account-orders">
         <div className="account-section-head"><div><p className="eyebrow">Your history</p><h2>Orders</h2></div><Package size={22}/></div>
+        {orders.some((order) => order.status === 'PENDING_REVIEW') && <div className="account-review-banner" role="status"><ShieldCheck size={18}/><span>One or more of your orders is under review. We’ll update you as soon as the review is complete.</span></div>}
         {orders.length ? orders.map((order) => <div className="customer-order" key={order.id}><div><strong>{order.orderNumber}</strong><small>{new Date(order.createdAt).toLocaleDateString('en-LK')} · {order.paymentMethod} · {order.fulfillmentMethod === 'PICKUP' ? 'Self pickup' : 'Delivery'}</small></div><span className={`status ${order.status.toLowerCase()}`}>{order.status}</span><strong>{money(order.total)}</strong></div>) : <div className="account-empty">No orders yet. <Link to="/cakes">Browse the bakehouse</Link></div>}
         <Link to="/cakes" className="account-browse"><ArrowLeft size={15}/> Continue shopping</Link>
       </section>

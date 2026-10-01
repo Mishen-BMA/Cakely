@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ArrowRight, CakeSlice } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
-import { api, unwrap } from '../services/api'
+import { api, rotateSessionId, unwrap } from '../services/api'
 
 export default function AdminLogin() {
   const navigate = useNavigate()
@@ -15,6 +15,7 @@ export default function AdminLogin() {
       const result = await unwrap(api.post('/auth/login', { identifier, password }))
       if (!result.data.user.isAdmin) throw new Error('Administrator access required.')
       localStorage.setItem('cakely_token', result.data.token)
+      rotateSessionId()
       navigate('/admin')
     } catch (err) {
       setError(err.response?.data?.error?.message || err.message || 'Unable to sign in.')

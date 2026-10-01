@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, HashRouter, Link, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ArrowRight, CakeSlice, ChevronDown, Menu, Search, ShoppingBag, Sparkles, X } from 'lucide-react'
-import { api, unwrap } from './services/api'
+import { api, rotateSessionId, unwrap } from './services/api'
 import './styles.css'
 import './extras.css'
 import './admin/admin.css'
@@ -195,6 +195,7 @@ function Login() {
         password: form.password,
       }))
       localStorage.setItem('cakely_token', result.data.token)
+      rotateSessionId()
       if (isAdmin) {
         navigate('/admin')
       } else {
@@ -228,7 +229,7 @@ function Register() {
   const navigate = useNavigate()
   const [form, setForm] = useState({ username: '', email: '', password: '' })
   const [error, setError] = useState('')
-  const submit = async (event) => { event.preventDefault(); setError(''); try { const result = await unwrap(api.post('/auth/register', form)); localStorage.setItem('cakely_token', result.data.token); navigate('/account') } catch (err) { setError(err.response?.data?.error?.message || 'Unable to create your account.') } }
+  const submit = async (event) => { event.preventDefault(); setError(''); try { const result = await unwrap(api.post('/auth/register', form)); localStorage.setItem('cakely_token', result.data.token); rotateSessionId(); navigate('/account') } catch (err) { setError(err.response?.data?.error?.message || 'Unable to create your account.') } }
   return <main className="auth"><div className="auth-art"><p className="eyebrow accent">Fresh starts</p><h1>Make room<br/><em>for cake.</em></h1></div><form onSubmit={submit}><p className="eyebrow">New customer</p><h2>Create your account</h2><label>Username<input required value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })}/></label><label>Email<input type="email" required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })}/></label><label>Password<input type="password" minLength="8" required value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })}/></label>{error && <p className="error">{error}</p>}<button className="button primary wide">Create account <ArrowRight size={17}/></button><Link className="text-link" to="/login">Already have an account? Sign in</Link></form></main>
 }
 

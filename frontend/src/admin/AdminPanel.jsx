@@ -1,6 +1,6 @@
-﻿import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { Boxes, BrainCircuit, ChevronRight, ClipboardList, LayoutDashboard, LogOut, Menu, PackagePlus, Pencil, Plus, Search, ShieldCheck, Sparkles, Tag, Trash2, Users, X } from 'lucide-react'
-import { api, unwrap } from '../services/api'
+import { api, rotateSessionId, unwrap } from '../services/api'
 import { useNavigate } from 'react-router-dom'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
@@ -157,25 +157,58 @@ function Products({ products, reload }) {
 
 function Orders({ orders, reload }) {
   const [query, setQuery] = useState('')
+  const [expanded, setExpanded] = useState({})
+  const [busyId, setBusyId] = useState(null)
+  const [error, setError] = useState('')
   const visible = (orders || []).filter((order) => `${order.orderNumber} ${order.customer || ''} ${order.status}`.toLowerCase().includes(query.toLowerCase()))
 
-  const update = async (id, status) => { await unwrap(api.patch(`/admin/orders/${id}`, { status })); reload() }
+  const act = async (order, body, description) => {
+    if (!window.confirm(`${description} for order ${order.orderNumber}?`)) return
+    setBusyId(order.id)
+    setError('')
+    try {
+      await unwrap(api.patch(`/admin/orders/${order.id}`, body))
+      await reload()
+    } catch (err) {
+      setError(err.response?.data?.error?.message || 'Unable to cancel this order.')
+    } finally {
+      setBusyId(null)
+    }
+  }
   return (
     <>
       <Header title="Orders" />
       <div className="admin-toolbar">
         <label className="admin-search"><Search size={17} /><input placeholder="Search order number or customer" value={query} onChange={(e) => setQuery(e.target.value)} /></label>
       </div>
+      {error && <div className="admin-error" role="alert">{error}</div>}
       <div className="admin-card">
         <Table>
           {visible.map((order) => (
-            <tr key={order.id}>
-              <td><strong>{order.orderNumber}</strong><small>{order.customer || 'Guest customer'}</small></td>
-              <td><span className={`admin-badge ${String(order.paymentMethod).toLowerCase()}`}>{order.paymentMethod}</span></td>
-              <td>{money(order.total)}</td>
-              <td><select value={order.status} onChange={(e) => update(order.id, e.target.value)}><option>PENDING</option><option>PENDING_REVIEW</option><option>CONFIRMED</option><option>PREPARING</option><option>READY</option><option>OUT_FOR_DELIVERY</option><option>DELIVERED</option><option>COMPLETED</option><option>CANCELLED</option></select></td>
-              <td className="align-right"><small>{new Date(order.createdAt).toLocaleDateString('en-LK')}</small></td>
-            </tr>
+            <Fragment key={order.id}>
+              <tr key={order.id}>
+                <td><strong>{order.orderNumber}</strong><small>{order.customer || 'Guest customer'}</small></td>
+                <td><span className={`admin-badge ${String(order.paymentMethod).toLowerCase()}`}>{order.paymentMethod}</span></td>
+                <td>{money(order.total)}</td>
+                <td><span className={`admin-badge ${String(order.status).toLowerCase()}`}>{order.status}</span></td>
+                <td><button type="button" className="admin-table-action" aria-expanded={Boolean(expanded[order.id])} onClick={() => setExpanded((current) => ({ ...current, [order.id]: !current[order.id] }))}>{expanded[order.id] ? 'Hide details' : 'View details'}</button></td>
+                <td className="align-right">
+                  {order.status === 'PENDING_REVIEW' && <><button type="button" className="admin-table-action" disabled={busyId === order.id} onClick={() => act(order, { action: 'release' }, 'Release')}>Release</button><button type="button" className="admin-table-action danger" disabled={busyId === order.id} onClick={() => act(order, { action: 'reject' }, 'Reject')}>Reject</button></>}
+                  {order.status === 'PENDING' && <button type="button" className="admin-table-action" disabled={busyId === order.id} onClick={() => act(order, { status: 'PREPARING' }, 'Start preparing')}>Prepare</button>}
+                  {order.status === 'PREPARING' && <button type="button" className="admin-table-action" disabled={busyId === order.id} onClick={() => act(order, { status: 'COMPLETED' }, 'Complete')}>Complete</button>}
+                  {order.paymentMethod === 'COD' && !['CANCELLED', 'REJECTED', 'REFUSED'].includes(order.status) && <button type="button" className="admin-table-action danger" disabled={busyId === order.id} onClick={() => act(order, { status: 'REFUSED' }, 'Mark refused at door')}>Refused</button>}
+                  {!['CANCELLED', 'REJECTED', 'REFUSED', 'COMPLETED'].includes(order.status) && <button type="button" className="admin-table-action danger" disabled={busyId === order.id} onClick={() => act(order, { status: 'CANCELLED' }, 'Cancel')}>Cancel</button>}
+                  <small>{new Date(order.createdAt).toLocaleDateString('en-LK')}</small>
+                </td>
+              </tr>
+              {expanded[order.id] && <tr className="admin-order-detail" key={`${order.id}-details`}><td colSpan="6">
+                <div className="admin-order-detail-grid">
+                  <section><strong>Items</strong>{(order.items || []).map((item, index) => <small key={`${item.productId || item.name}-${index}`}>{item.quantity} × {item.name} · {item.size} · {item.flavour} ({money(item.unitPrice)})</small>)}</section>
+                  <section><strong>Customer and fulfillment</strong><small>{order.address?.recipient || order.address?.name || order.customer || 'Guest customer'}{order.customerEmail ? ` · ${order.customerEmail}` : ''}</small><small>{order.address?.phone || 'No phone provided'}</small><small>{order.fulfillmentMethod === 'PICKUP' ? `Self pickup · ${order.address?.pickupLocation || 'Cakely Colombo'}` : [order.address?.address, order.address?.city, order.address?.district, order.address?.postalCode].filter(Boolean).join(', ') || 'No delivery address'}</small></section>
+                  <section><strong>Payment and totals</strong><small>{order.paymentMethod} · {order.paymentStatus || 'PENDING'}</small><small>Subtotal: {money(order.subtotal)} · Discount: {money(order.discount)}</small><small>Delivery and fees: {money(order.deliveryFee)} · Total: {money(order.total)}</small></section>
+                </div>
+              </td></tr>}
+            </Fragment>
           ))}
         </Table>
         {!visible.length && <Empty text="No orders match this search." />}
@@ -309,7 +342,7 @@ export default function AdminPanel() {
             </button>
           ))}
         </nav>
-        <button className="admin-logout" onClick={() => { localStorage.removeItem('cakely_token'); navigate('/login') }}><LogOut size={17} /> Logout</button>
+        <button className="admin-logout" onClick={() => { localStorage.removeItem('cakely_token'); rotateSessionId(); navigate('/login') }}><LogOut size={17} /> Logout</button>
       </aside>
       <main className="admin-main">
         {error ? <div className="admin-error"><ShieldCheck size={20} /><span>{error}</span></div> : content}
