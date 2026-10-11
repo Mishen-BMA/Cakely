@@ -1,13 +1,17 @@
 import { useEffect, useState } from 'react'
 import { ArrowLeft, CircleUserRound, Home, LogOut, Package, ShieldCheck, Trash2 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { api, rotateSessionId, unwrap } from './services/api'
+import RuleLockReviewPanel from './RuleLockReviewPanel'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
 const blankAddress = { label: 'Home', recipient: '', phone: '', address: '', city: 'Colombo', district: 'Colombo', postalCode: '', isDefault: false }
 
 export default function CustomerAccount() {
   const navigate = useNavigate()
+  const location = useLocation()
+  const [cancelError, setCancelError] = useState('')
+  const [openedOrder] = useState(location.state?.order?.id || null)
   const [profile, setProfile] = useState(null)
   const [orders, setOrders] = useState([])
   const [addresses, setAddresses] = useState([])
@@ -34,6 +38,10 @@ export default function CustomerAccount() {
   }
   const removeAddress = async (id) => { await unwrap(api.delete(`/addresses/${id}`)); setAddresses((current) => current.filter((address) => address.id !== id)) }
   const logout = () => { localStorage.removeItem('cakely_token'); rotateSessionId(); navigate('/login') }
+  const cancelOrder = async (order) => {
+    setCancelError('')
+    try { await unwrap(api.post(`/orders/${order.id}/cancel`)); await load() } catch (err) { setCancelError(err.response?.data?.error?.message || 'Unable to cancel this order.') }
+  }
 
   if (!profile) return <main className="page narrow"><div className="empty"><p>Loading your account...</p></div></main>
 
@@ -47,7 +55,16 @@ export default function CustomerAccount() {
       <section className="account-orders">
         <div className="account-section-head"><div><p className="eyebrow">Your history</p><h2>Orders</h2></div><Package size={22}/></div>
         {orders.some((order) => order.status === 'PENDING_REVIEW') && <div className="account-review-banner" role="status"><ShieldCheck size={18}/><span>One or more of your orders is under review. We’ll update you as soon as the review is complete.</span></div>}
-        {orders.length ? orders.map((order) => <div className="customer-order" key={order.id}><div><strong>{order.orderNumber}</strong><small>{new Date(order.createdAt).toLocaleDateString('en-LK')} · {order.paymentMethod} · {order.fulfillmentMethod === 'PICKUP' ? 'Self pickup' : 'Delivery'}</small></div><span className={`status ${order.status.toLowerCase()}`}>{order.status}</span><strong>{money(order.total)}</strong></div>) : <div className="account-empty">No orders yet. <Link to="/cakes">Browse the bakehouse</Link></div>}
+        {cancelError && <p className="error" role="alert">{cancelError}</p>}
+        {orders.length ? orders.map((order) => {
+          const statusLabel = order.status === 'PENDING_REVIEW' ? 'Under review' : order.status === 'REJECTED' ? 'Cancelled by RuleLock' : order.rulelockReview?.decision === 'void_discount' ? 'Discount removed' : order.status === 'PENDING' ? 'Approved' : order.status
+          return <article className="customer-order-card" key={order.id}>
+            <div className="customer-order"><div><strong>{order.orderNumber}</strong><small>{new Date(order.createdAt).toLocaleDateString('en-LK')} · {order.paymentMethod} · {order.fulfillmentMethod === 'PICKUP' ? 'Self pickup' : 'Delivery'}</small></div><span className={`status ${order.status.toLowerCase()}`}>{statusLabel}</span><strong>{money(order.total)}</strong></div>
+            {order.status === 'REJECTED' && <p className="rulelock-cause"><strong>Automatically cancelled by RuleLock:</strong> {order.rulelockReview?.reason || order.rulelockReview?.customer_message || 'Order rejected.'}</p>}
+            {['PENDING', 'PENDING_REVIEW'].includes(order.status) && <button type="button" className="account-cancel-order" onClick={() => cancelOrder(order)}>Cancel order</button>}
+            <RuleLockReviewPanel review={order.rulelockReview} open={order.id === openedOrder}/>
+          </article>
+        }) : <div className="account-empty">No orders yet. <Link to="/cakes">Browse the bakehouse</Link></div>}
         <Link to="/cakes" className="account-browse"><ArrowLeft size={15}/> Continue shopping</Link>
       </section>
     </div>

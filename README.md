@@ -140,6 +140,14 @@ need server-side rewrite rules.
 
 ## Tests and CI
 
+### RuleLock attack demo
+
+Set `CAKELY_URL`, `DEMO_USER`, and `DEMO_PASSWORD` for a running demo shop.
+Run `node scripts/attack-demo.mjs` to log in and post attack checkouts directly to the API.
+It tries stacked percentage coupons and a quantity of 50, then creates and cancels three COD orders.
+It submits a fourth COD order and prints the C2, C3, and C4 summary for each review.
+Use a demo customer account with at least two active percentage coupons.
+
 Install root and frontend dependencies, then run the tests:
 
 ```bash

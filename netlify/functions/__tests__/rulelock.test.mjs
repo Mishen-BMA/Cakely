@@ -44,8 +44,9 @@ function makeDatabase() {
     }
     if (table === 'coupons') {
       const code = filters.find(([key]) => key === 'code')?.[1]
-      if (!['SAVE500', 'FREEDESSERT'].includes(code)) return { data: null, error: null }
-      return { data: { id: code === 'SAVE500' ? 3 : 4, code, active: true, discount_type: code === 'FREEDESSERT' ? 'FIXED' : 'FIXED', discount_value: code === 'SAVE500' ? 500 : 0, minimum_order: 0, can_stack: false, allowed_payment_methods: ['COD'], free_delivery: code === 'FREEDESSERT', first_order_only: state.firstOrderOnly } , error: null }
+      if (!['SAVE500', 'FREEDESSERT', 'PCT10', 'PCT20'].includes(code)) return { data: null, error: null }
+      const percentage = code === 'PCT10' || code === 'PCT20'
+      return { data: { id: ({ SAVE500: 3, FREEDESSERT: 4, PCT10: 5, PCT20: 6 })[code], code, active: true, discount_type: percentage ? 'PERCENTAGE' : 'FIXED', discount_value: code === 'SAVE500' ? 500 : code === 'PCT10' ? 10 : code === 'PCT20' ? 20 : 0, minimum_order: 0, can_stack: false, allowed_payment_methods: percentage ? ['CARD'] : ['COD'], free_delivery: code === 'FREEDESSERT', first_order_only: state.firstOrderOnly } , error: null }
     }
     if (table === 'coupon_usages') {
       if (operation === 'insert') { state.couponUsages.push(payload); return { data: payload, error: null } }
@@ -138,11 +139,16 @@ const checkout = (extra = {}) => request(app).post('/checkout')
   .send({ items: [{ productId: 12, size: '1 kg', quantity: 1 }], address: { name: 'Casey', phone: '+94 77 123 4567', address: '12 Cake Street', city: 'Colombo', district: 'Colombo' }, paymentMethod: 'CARD', fulfillmentMethod: 'DELIVERY', coupons: [], ...extra })
 
 function rulelockResponse(decision, customer_message = 'Order received.') {
-  return { order_id: 20, decision, payment_action: 'none', reason: 'internal-only', customer_message, account_action: null, rule_result: {}, anomaly_result: {}, enforcement_result: {} }
+  return { order_id: 20, decision, payment_action: 'none', reason: 'internal-only', customer_message, account_action: null, rule_result: {}, anomaly_result: {}, enforcement_result: {}, pipeline: {
+    c1_data_collection: { status: 'complete', events_in_session: 2, session_features: { velocity: 1, device_reuse: 0, address_reuse: 0, account_age: 10 }, account: { user_id: 7, username: 'customer', account_age_days: 10, completed_orders: 1, cod_orders: 2, cod_bad_orders: 0 } },
+    c2_rule_engine: { status: 'pass', checks: [{ code: 'valid', label: 'Valid order', passed: true, detail: 'All checks passed' }], violations: [] },
+    c3_anomaly: { status: 'normal', score: 0.1, hold_threshold: 0.5, reject_threshold: 0.8 },
+    c4_enforcement: { decision, action: decision, reason: 'internal-only', account_action: null },
+  } }
 }
 
 describe('RuleLock checkout contract', () => {
-  it('posts the v2 body to /review-order and accepts only after a valid decision', async () => {
+  it('posts the v3 request body to /review-order and accepts only after a valid decision', async () => {
     fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
     const response = await checkout().expect(201)
     const [url, options] = fetch.mock.calls[0]
@@ -151,14 +157,17 @@ describe('RuleLock checkout contract', () => {
     expect(options.headers.Authorization).toBe('Bearer test-token')
     expect(options.headers['X-Session-ID']).toBe('session-test')
     expect(body).toMatchObject({ order_id: 20, order_reference: expect.stringMatching(/^CK-\d{14}-[A-Z0-9]{4}$/), account_id: '7', payment_method: 'CARD', items: [{ sku: 'sku-12', name: 'Cake', size: '1 kg', quantity: 1, unit_price: 1000 }] })
+    expect(body.order_reference).toBe(db.state.orders[0].order_number)
+    expect(response.body.data.orderNumber).toBe(db.state.orders[0].order_number)
     expect(Object.keys(body).sort()).toEqual(['order_id', 'order_reference', 'account_id', 'user_id', 'customer_name', 'session_id', 'device_id', 'phone_hash', 'address_hash', 'payment_method', 'items', 'coupons_applied', 'discount_value', 'subtotal', 'total', 'account_verified', 'past_orders', 'past_refusals'].sort())
     expect(Object.keys(body.items[0]).sort()).toEqual(['sku', 'name', 'size', 'quantity', 'unit_price'].sort())
     expect(body.phone_hash).toMatch(/^[a-f0-9]{64}$/)
     expect(body.address_hash).toMatch(/^[a-f0-9]{64}$/)
     expect(body).not.toHaveProperty('phone')
     expect(body).not.toHaveProperty('address')
-    expect(Object.keys(rulelockResponse('accept')).sort()).toEqual(['order_id', 'decision', 'payment_action', 'reason', 'customer_message', 'account_action', 'rule_result', 'anomaly_result', 'enforcement_result'].sort())
+    expect(rulelockResponse('accept')).toHaveProperty('pipeline.c4_enforcement.decision', 'accept')
     expect(db.state.orders[0]).toMatchObject({ payment_status: 'PAID', status: 'PENDING' })
+    expect(db.state.orders[0].rulelock_review).toMatchObject({ decision: 'accept', reason: 'internal-only', pipeline: { c3_anomaly: { score: 0.1 } } })
     expect(response.body.data.status).toBe('PENDING')
     expect(db.state.events.some((event) => event.event_type === 'RULELOCK_REVIEW')).toBe(false)
     expect(db.state.events.some((event) => event.event_type === 'RULELOCK_DECISION_APPLIED')).toBe(true)
@@ -173,12 +182,13 @@ describe('RuleLock checkout contract', () => {
     expect(response.body.data.customerMessage).toBe('Your order is under review. We will update you soon.')
   })
 
-  it('rejects with only the customer message and does not record coupon usage', async () => {
+  it('returns the rejected order details and saves the review without recording coupon usage', async () => {
     fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('reject', 'We could not accept this order.') })
-    const response = await checkout({ paymentMethod: 'COD', coupons: ['SAVE500'] }).expect(403)
-    expect(response.body).toEqual({ customer_message: 'We could not accept this order.' })
-    expect(JSON.stringify(response.body)).not.toContain('internal-only')
+    const response = await checkout({ paymentMethod: 'COD', coupons: ['SAVE500'] }).expect(201)
+    expect(response.body.data).toMatchObject({ status: 'REJECTED', decision: 'reject', customerMessage: 'We could not accept this order.', review: { reason: 'internal-only' } })
+    expect(response.body.data.review.reason).toBe('internal-only')
     expect(db.state.orders[0]).toMatchObject({ status: 'REJECTED', payment_status: 'VOIDED' })
+    expect(db.state.orders[0].rulelock_review.pipeline.c4_enforcement.decision).toBe('reject')
     expect(db.state.couponUsages).toHaveLength(0)
   })
 
@@ -203,14 +213,16 @@ describe('RuleLock checkout contract', () => {
 
   it('sends only REFUSED COD history and completed-order verification', async () => {
     db.state.orders.push(
-      { id: 3, user_id: 7, payment_method: 'COD', status: 'CANCELLED' },
+      { id: 3, user_id: 7, payment_method: 'COD', status: 'CANCELLED', cancelled_by: 'CUSTOMER' },
       { id: 4, user_id: 7, payment_method: 'COD', status: 'REJECTED' },
       { id: 5, user_id: 7, payment_method: 'COD', status: 'REFUSED' },
+      { id: 7, user_id: 7, payment_method: 'COD', status: 'CANCELLED', cancelled_by: 'ADMIN' },
+      { id: 8, user_id: 7, payment_method: 'COD', status: 'CANCELLED' },
       { id: 6, user_id: 7, payment_method: 'CARD', status: 'COMPLETED' },
     )
     fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
     await checkout({ paymentMethod: 'COD' }).expect(201)
-    expect(JSON.parse(fetch.mock.calls[0][1].body)).toMatchObject({ past_orders: 3, past_refusals: 1, account_verified: true })
+    expect(JSON.parse(fetch.mock.calls[0][1].body)).toMatchObject({ past_orders: 5, past_refusals: 2, account_verified: true })
   })
 
   it('keeps an order on hold when the enabled service has no base URL', async () => {
@@ -248,6 +260,38 @@ describe('RuleLock checkout contract', () => {
     expect(override.metadata).toMatchObject({ order_id: 42, action: 'release', admin_id: 1, previous_decision: 'hold' })
     await request(app).patch('/admin/orders/42').set('Authorization', authorization).send({ status: 'REFUSED' }).expect(200)
     expect(db.state.orders.find((order) => order.id === 42).status).toBe('REFUSED')
+    await request(app).patch('/admin/orders/42').set('Authorization', authorization).send({ status: 'CANCELLED' }).expect(200)
+    expect(db.state.orders.find((order) => order.id === 42)).toMatchObject({ status: 'CANCELLED', cancelled_by: 'ADMIN' })
+  })
+
+  it('allows only the owner to cancel pending orders and records customer attribution', async () => {
+    db.state.orders.push({ id: 43, user_id: 7, payment_method: 'COD', status: 'PENDING_REVIEW', payment_status: 'ON_HOLD' })
+    const authorization = `Bearer ${jwt.sign({ sub: String(user.id), role: 'customer' }, 'unit-test-jwt-secret')}`
+    await request(app).post('/orders/43/cancel').set('Authorization', authorization).expect(200)
+    expect(db.state.orders.find((order) => order.id === 43)).toMatchObject({ status: 'CANCELLED', cancelled_by: 'CUSTOMER' })
+    expect(db.state.events.find((event) => event.event_type === 'ORDER_CANCELLED')).toMatchObject({ user_id: 7, order_id: 43, metadata: { cancelled_by: 'CUSTOMER' } })
+    await request(app).post('/orders/43/cancel').set('Authorization', authorization).expect(400)
+    await request(app).post('/orders/43/cancel').set('Authorization', `Bearer ${jwt.sign({ sub: '1', role: 'admin' }, 'unit-test-jwt-secret')}`).expect(401)
+  })
+
+  it('normalizes a RuleLock URL that already ends in /review-order/', async () => {
+    vi.stubEnv('RULELOCK_API_URL', 'https://rulelock.example/review-order///')
+    delete require.cache[apiPath]
+    app = require('../api.js').app
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout().expect(201)
+    expect(fetch.mock.calls[0][0]).toBe('https://rulelock.example/review-order')
+  })
+
+  it('removes the quantity cap and allows percentage coupon stacking in research mode', async () => {
+    vi.stubEnv('CAKELY_SECURITY_MODE', 'research')
+    delete require.cache[apiPath]
+    app = require('../api.js').app
+    fetch.mockResolvedValue({ status: 200, json: async () => rulelockResponse('accept') })
+    await checkout({ items: [{ productId: 12, size: '1 kg', quantity: 50 }], coupons: ['PCT10', 'PCT20'], discount: 15000 }).expect(201)
+    expect(db.state.orders[0].items[0].quantity).toBe(50)
+    expect(db.state.orders[0]).toMatchObject({ discount: 15000, subtotal: 50000 })
+    expect(db.state.couponUsages).toHaveLength(2)
   })
 
   it('stores the RuleLock toggle in platform_settings and progresses pending orders', async () => {

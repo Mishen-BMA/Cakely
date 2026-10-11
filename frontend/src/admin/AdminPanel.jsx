@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from 'react'
 import { Boxes, BrainCircuit, ChevronRight, ClipboardList, LayoutDashboard, LogOut, Menu, PackagePlus, Pencil, Plus, Search, ShieldCheck, Sparkles, Tag, Trash2, Users, X } from 'lucide-react'
 import { api, rotateSessionId, unwrap } from '../services/api'
 import { useNavigate } from 'react-router-dom'
+import RuleLockReviewPanel from '../RuleLockReviewPanel'
 
 const money = (value) => `Rs. ${Number(value || 0).toLocaleString('en-LK')}`
 const apiOrigin = (import.meta.env.VITE_API_URL || '/api').replace(/\/api\/?$/, '')
@@ -77,7 +78,7 @@ function Dashboard({ data, onNavigate }) {
             <Table>
               {stats.recentOrders.map((order) => (
                 <tr key={order.id}>
-                  <td><strong>{order.orderNumber}</strong><small>{order.customer || 'Guest'}</small></td>
+                  <td><strong>{order.orderNumber}</strong><small>#{order.id} · {order.customer || 'Guest'}</small></td>
                   <td><span className={`admin-badge ${String(order.status).toLowerCase()}`}>{order.status}</span></td>
                   <td className="align-right">{money(order.total)}</td>
                 </tr>
@@ -194,7 +195,7 @@ function Orders({ orders, reload, pagination, onPageChange }) {
           {visible.map((order) => (
             <Fragment key={order.id}>
               <tr key={order.id}>
-                <td><strong>{order.orderNumber}</strong><small>{order.customer || 'Guest customer'}</small></td>
+                <td><strong>{order.orderNumber}</strong><small>#{order.id} · {order.customer || 'Guest customer'}</small></td>
                 <td><span className={`admin-badge ${String(order.paymentMethod).toLowerCase()}`}>{order.paymentMethod}</span></td>
                 <td>{money(order.total)}</td>
                 <td><span className={`admin-badge ${String(order.status).toLowerCase()}`}>{order.status}</span></td>
@@ -213,6 +214,7 @@ function Orders({ orders, reload, pagination, onPageChange }) {
                   <section><strong>Items</strong>{(order.items || []).map((item, index) => <small key={`${item.productId || item.name}-${index}`}>{item.quantity} × {item.name} · {item.size} · {item.flavour} ({money(item.unitPrice)})</small>)}</section>
                   <section><strong>Customer and fulfillment</strong><small>{order.address?.recipient || order.address?.name || order.customer || 'Guest customer'}{order.customerEmail ? ` · ${order.customerEmail}` : ''}</small><small>{order.address?.phone || 'No phone provided'}</small><small>{order.fulfillmentMethod === 'PICKUP' ? `Self pickup · ${order.address?.pickupLocation || 'Cakely Colombo'}` : [order.address?.address, order.address?.city, order.address?.district, order.address?.postalCode].filter(Boolean).join(', ') || 'No delivery address'}</small></section>
                   <section><strong>Payment and totals</strong><small>{order.paymentMethod} · {order.paymentStatus || 'PENDING'}</small><small>Subtotal: {money(order.subtotal)} · Discount: {money(order.discount)}</small><small>Delivery and fees: {money(order.deliveryFee)} · Total: {money(order.total)}</small></section>
+                  <RuleLockReviewPanel review={order.rulelockReview} admin />
                 </div>
               </td></tr>}
             </Fragment>
@@ -362,6 +364,7 @@ export default function AdminPanel() {
         <button className="admin-logout" onClick={() => { localStorage.removeItem('cakely_token'); rotateSessionId(); navigate('/login') }}><LogOut size={17} /> Logout</button>
       </aside>
       <main className="admin-main">
+        <div className={`security-mode-badge ${data.securityMode === 'research' ? 'vulnerable' : ''}`}>{data.securityMode === 'research' ? 'VULNERABLE MODE' : 'SECURE MODE'}</div>
         {error ? <div className="admin-error"><ShieldCheck size={20} /><span>{error}</span></div> : content}
       </main>
     </div>

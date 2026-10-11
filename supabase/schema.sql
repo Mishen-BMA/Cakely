@@ -56,12 +56,20 @@ create table if not exists orders (
   payment_method varchar(30) not null,
   payment_status varchar(30) not null default 'PENDING',
   status         varchar(30) not null default 'PENDING',
+  cancelled_by   text check (cancelled_by is null or cancelled_by in ('CUSTOMER', 'ADMIN')),
+  rulelock_review jsonb,
   subtotal       numeric(10, 2) not null,
   discount       numeric(10, 2) not null default 0,
   delivery_fee   numeric(10, 2) not null default 350,
   total          numeric(10, 2) not null,
   created_at     timestamptz not null default now()
 );
+
+alter table orders add column if not exists cancelled_by text;
+alter table orders add column if not exists rulelock_review jsonb;
+alter table orders drop constraint if exists orders_cancelled_by_check;
+alter table orders add constraint orders_cancelled_by_check
+  check (cancelled_by is null or cancelled_by in ('CUSTOMER', 'ADMIN'));
 
 create table if not exists transaction_events (
   id         bigint generated always as identity primary key,

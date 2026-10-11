@@ -177,6 +177,12 @@ async function isRulelockEnabled() {
 }
 
 function validRulelockResponse(value, expectedOrderId) {
+  const pipeline = value?.pipeline;
+  const hasPipeline = pipeline && typeof pipeline === "object" && !Array.isArray(pipeline)
+    && pipeline.c1_data_collection && pipeline.c2_rule_engine && pipeline.c3_anomaly && pipeline.c4_enforcement
+    && typeof pipeline.c2_rule_engine.status === "string" && Array.isArray(pipeline.c2_rule_engine.checks) && Array.isArray(pipeline.c2_rule_engine.violations)
+    && typeof pipeline.c3_anomaly.status === "string" && Number.isFinite(Number(pipeline.c3_anomaly.score))
+    && typeof pipeline.c4_enforcement.decision === "string";
   return Boolean(value && typeof value === "object" && !Array.isArray(value)
     && Number(value.order_id) === Number(expectedOrderId)
     && ["accept", "hold", "reject", "void_discount"].includes(value.decision)
@@ -184,10 +190,12 @@ function validRulelockResponse(value, expectedOrderId) {
     && typeof value.reason === "string"
     && typeof value.customer_message === "string"
     && (value.account_action === null || (value.account_action && value.account_action.type === "rate_limit" && Number.isFinite(Number(value.account_action.minutes)) && Number(value.account_action.minutes) > 0))
-    && [value.rule_result, value.anomaly_result, value.enforcement_result].every((result) => result === null || (typeof result === "object" && !Array.isArray(result))));
+    && [value.rule_result, value.anomaly_result, value.enforcement_result].every((result) => result === null || (typeof result === "object" && !Array.isArray(result)))
+    && hasPipeline);
 }
 
 async function reviewWithRuleLock({ orderId, orderReference, accountId, userId, customerName, sessionId, deviceId, phoneHash, addressHash, coupons, discount, items, subtotal, total, paymentMethod, accountVerified, pastOrders, pastRefusals }) {
+  if (typeof orderReference !== "string" || !orderReference.trim()) throw new Error("RuleLock order_reference is required.");
   if (!RULELOCK_API_URL) {
     console.error("RuleLock is enabled but RULELOCK_API_URL is missing");
     return { decision: "hold", customer_message: "Your order is under review. We will update you soon.", reason: "RuleLock URL missing" };
@@ -196,7 +204,7 @@ async function reviewWithRuleLock({ orderId, orderReference, accountId, userId, 
     console.error("RuleLock is enabled but RULELOCK_API_TOKEN is missing");
     return { decision: "hold", customer_message: "Your order is under review. We will update you soon.", reason: "RuleLock token missing" };
   }
-  const baseUrl = RULELOCK_API_URL.replace(/\/+$/, "");
+  const baseUrl = RULELOCK_API_URL.replace(/\/+$/, "").replace(/\/review-order$/i, "").replace(/\/+$/, "");
   const url = `${baseUrl}/review-order`;
   const body = {
     order_id: orderId,
@@ -243,13 +251,13 @@ async function reviewWithRuleLock({ orderId, orderReference, accountId, userId, 
 }
 
 async function codHistory(userId, excludeOrderId = null) {
-  let query = supabase.from("orders").select("status").eq("user_id", userId).eq("payment_method", "COD");
+  let query = supabase.from("orders").select("status,cancelled_by").eq("user_id", userId).eq("payment_method", "COD");
   if (excludeOrderId) query = query.neq("id", excludeOrderId);
   const { data } = await query;
   const rows = data || [];
   return {
     pastOrders: rows.length,
-    pastRefusals: rows.filter((row) => row.status === "REFUSED").length,
+    pastRefusals: rows.filter((row) => row.status === "REFUSED" || (row.status === "CANCELLED" && row.cancelled_by === "CUSTOMER")).length,
   };
 }
 
@@ -372,6 +380,7 @@ app.get("/coupons", async (_req, res) => {
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
   res.json({
     success: true,
+    securityMode: SECURITY_MODE,
     data: (data || []).map((row) => ({
       code: row.code,
       description: row.description,
@@ -611,6 +620,7 @@ app.post("/checkout", async (req, res) => {
   }
 
   const voidDiscount = rulelockResult.decision === "void_discount";
+  const originalDecision = rulelockResult.decision;
   if (voidDiscount) {
     discount = 0;
     appliedCoupons = [];
@@ -631,14 +641,23 @@ app.post("/checkout", async (req, res) => {
       return res.status(503).json({ success: false, error: { code: "COUPON_USAGE_UNAVAILABLE", message: "Coupon availability could not be confirmed. Please retry checkout." } });
     }
   }
-  const { data: updatedOrder, error: updateError } = await supabase.from("orders").update({ status: finalStatus, payment_status: paymentStatus, discount, delivery_fee: delivery + codFee, total }).eq("id", order.id).select().single();
+  const review = rulelockOn ? {
+    decision: originalDecision,
+    reason: rulelockResult.reason || null,
+    customer_message: rulelockResult.customer_message || null,
+    pipeline: rulelockResult.pipeline || null,
+    reviewed_at: new Date().toISOString(),
+    ...(rulelockResult.error ? { error: rulelockResult.error } : {}),
+  } : null;
+  if (rulelockOn && (!rulelockResult.pipeline || String(rulelockResult.reason || "").toLowerCase().includes("unavailable"))) review.error = "RuleLock unavailable";
+  const { data: updatedOrder, error: updateError } = await supabase.from("orders").update({ status: finalStatus, payment_status: paymentStatus, discount, delivery_fee: delivery + codFee, total, rulelock_review: review }).eq("id", order.id).select().single();
   if (updateError) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: updateError.message } });
   order = updatedOrder;
 
   if (rulelockOn) await record("RULELOCK_DECISION_APPLIED", { ...eventContext, order_id: order.id, decision, resulting_status: finalStatus }, user.id, order.id, sessionId);
 
-  if (decision === "reject") return res.status(403).json({ customer_message: rulelockResult.customer_message });
-  res.status(201).json({ success: true, data: { id: order.id, orderNumber: order.order_number, total, status: order.status, customerMessage: rulelockResult.customer_message } });
+  if (decision === "reject") return res.status(201).json({ success: true, data: { id: order.id, orderNumber: order.order_number, total, status: "REJECTED", decision: originalDecision, customerMessage: rulelockResult.customer_message, review } });
+  res.status(201).json({ success: true, data: { id: order.id, orderNumber: order.order_number, total, status: order.status, decision: originalDecision, customerMessage: rulelockResult.customer_message, review } });
 });
 
 app.get("/orders", async (req, res) => {
@@ -648,8 +667,22 @@ app.get("/orders", async (req, res) => {
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
   res.json({
     success: true,
-    data: (data || []).map((row) => ({ id: row.id, orderNumber: row.order_number, items: row.items, subtotal: Number(row.subtotal), discount: Number(row.discount), deliveryFee: Number(row.delivery_fee), total: Number(row.total), status: row.status, paymentMethod: row.payment_method, fulfillmentMethod: row.address?.fulfillmentMethod || "DELIVERY", createdAt: row.created_at })),
+    data: (data || []).map((row) => ({ id: row.id, orderNumber: row.order_number, items: row.items, subtotal: Number(row.subtotal), discount: Number(row.discount), deliveryFee: Number(row.delivery_fee), total: Number(row.total), status: row.status, paymentMethod: row.payment_method, fulfillmentMethod: row.address?.fulfillmentMethod || "DELIVERY", rulelockReview: row.rulelock_review || null, createdAt: row.created_at })),
   });
+});
+
+app.post("/orders/:id/cancel", async (req, res) => {
+  const { user } = await currentUser(req);
+  if (!user || user.is_admin) return authErrorResponse(res);
+  const orderId = Number(req.params.id);
+  if (!Number.isSafeInteger(orderId) || orderId < 1) return res.status(400).json({ success: false, error: { code: "INVALID_ORDER", message: "Order id is invalid." } });
+  const { data: existing } = await supabase.from("orders").select("*").eq("id", orderId).eq("user_id", user.id).maybeSingle();
+  if (!existing) return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Order not found." } });
+  if (!["PENDING", "PENDING_REVIEW"].includes(existing.status)) return res.status(400).json({ success: false, error: { code: "INVALID_ORDER_ACTION", message: "Only pending orders can be cancelled." } });
+  const { data: updated, error } = await supabase.from("orders").update({ status: "CANCELLED", cancelled_by: "CUSTOMER" }).eq("id", orderId).eq("user_id", user.id).in("status", ["PENDING", "PENDING_REVIEW"]).select().maybeSingle();
+  if (error || !updated) return res.status(400).json({ success: false, error: { code: "INVALID_ORDER_ACTION", message: "Order could not be cancelled." } });
+  await record("ORDER_CANCELLED", { status: "CANCELLED", cancelled_by: "CUSTOMER" }, user.id, orderId, req.headers["x-session-id"] || null, requestEventContext(req, user));
+  res.json({ success: true, data: { id: updated.id, status: updated.status } });
 });
 
 app.get("/admin/summary", async (req, res) => {
@@ -726,6 +759,7 @@ app.get("/admin/dashboard", async (req, res) => {
     deliveryFee: Number(row.delivery_fee),
     total: Number(row.total),
     status: row.status,
+    rulelockReview: row.rulelock_review || null,
     paymentMethod: row.payment_method,
     paymentStatus: row.payment_status,
     fulfillmentMethod: row.address?.fulfillmentMethod || "DELIVERY",
@@ -767,6 +801,7 @@ app.get("/admin/dashboard", async (req, res) => {
       events: eventDicts,
       rulelockEnabled: platformSettings?.rulelock_enabled === true,
       rulelockConfigured: Boolean(RULELOCK_API_URL),
+      securityMode: SECURITY_MODE,
       pagination: {
         orders: pageInfo(pages.orders, ordersResult.count),
         customers: pageInfo(pages.customers, customersResult.count),
@@ -887,7 +922,7 @@ app.patch("/admin/orders/:id", async (req, res) => {
     if (existing.payment_method !== "COD" || !["PENDING", "PREPARING", "COMPLETED"].includes(existing.status)) return res.status(400).json({ success: false, error: { code: "INVALID_ORDER_ACTION", message: "Only a COD order can be marked refused." } });
     updates = { status: "REFUSED" };
   } else if (status === "CANCELLED") {
-    updates = { status: "CANCELLED" };
+    updates = { status: "CANCELLED", cancelled_by: "ADMIN" };
   } else if (status === "PREPARING" && existing.status === "PENDING" || status === "COMPLETED" && existing.status === "PREPARING") {
     updates = { status };
   } else {

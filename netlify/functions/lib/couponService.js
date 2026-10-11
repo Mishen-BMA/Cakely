@@ -46,7 +46,7 @@ async function validateCoupons({ codes, subtotal, user, paymentMethod, securityM
       result.rejected.push({ code, reason: `Coupon is not valid for ${paymentMethod}` });
       continue;
     }
-    if (coupon.discount_type === "PERCENTAGE" && result.accepted.some((item) => item.discountType === "PERCENTAGE")) {
+    if (securityMode !== "research" && coupon.discount_type === "PERCENTAGE" && result.accepted.some((item) => item.discountType === "PERCENTAGE")) {
       result.rejected.push({ code, reason: "Only one percentage coupon can be used" });
       continue;
     }
