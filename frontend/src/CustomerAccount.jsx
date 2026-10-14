@@ -57,12 +57,11 @@ export default function CustomerAccount() {
         {orders.some((order) => order.status === 'PENDING_REVIEW') && <div className="account-review-banner" role="status"><ShieldCheck size={18}/><span>One or more of your orders is under review. We’ll update you as soon as the review is complete.</span></div>}
         {cancelError && <p className="error" role="alert">{cancelError}</p>}
         {orders.length ? orders.map((order) => {
-          const statusLabel = order.status === 'PENDING_REVIEW' ? 'Under review' : order.status === 'REJECTED' ? 'Cancelled by RuleLock' : order.rulelockReview?.decision === 'void_discount' ? 'Discount removed' : order.status === 'PENDING' ? 'Approved' : order.status
+          const statusLabel = order.status === 'PENDING_REVIEW' ? 'Processing' : order.status === 'REJECTED' ? 'Cancelled' : order.status === 'PENDING' ? 'Confirmed' : order.status
           return <article className="customer-order-card" key={order.id}>
             <div className="customer-order"><div><strong>{order.orderNumber}</strong><small>{new Date(order.createdAt).toLocaleDateString('en-LK')} · {order.paymentMethod} · {order.fulfillmentMethod === 'PICKUP' ? 'Self pickup' : 'Delivery'}</small></div><span className={`status ${order.status.toLowerCase()}`}>{statusLabel}</span><strong>{money(order.total)}</strong></div>
-            {order.status === 'REJECTED' && <p className="rulelock-cause"><strong>Automatically cancelled by RuleLock:</strong> {order.rulelockReview?.reason || order.rulelockReview?.customer_message || 'Order rejected.'}</p>}
+            {order.status === 'REJECTED' && <p className="rulelock-cause"><strong>Order status:</strong> {order.rulelockReview?.customer_message || 'Order could not be processed.'}</p>}
             {['PENDING', 'PENDING_REVIEW'].includes(order.status) && <button type="button" className="account-cancel-order" onClick={() => cancelOrder(order)}>Cancel order</button>}
-            <RuleLockReviewPanel review={order.rulelockReview} open={order.id === openedOrder}/>
           </article>
         }) : <div className="account-empty">No orders yet. <Link to="/cakes">Browse the bakehouse</Link></div>}
         <Link to="/cakes" className="account-browse"><ArrowLeft size={15}/> Continue shopping</Link>
