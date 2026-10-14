@@ -20,18 +20,24 @@ alter table public.coupons
   add column if not exists active boolean not null default true,
   add column if not exists created_at timestamptz not null default now();
 
--- Copy legacy column values if they exist
+-- 2. Drop legacy constraints on "value" and "discount_type" from earlier schemas
 do $$
 begin
-  if exists (select 1 from information_schema.columns where table_name='coupons' and column_name='value') then
-    update public.coupons set discount_value = value where discount_value = 0 and value is not null;
+  -- Drop not null on legacy "value" column if it exists
+  if exists (select 1 from information_schema.columns where table_schema='public' and table_name='coupons' and column_name='value') then
+    alter table public.coupons alter column "value" drop not null;
   end if;
-  if exists (select 1 from information_schema.columns where table_name='coupons' and column_name='min_spend') then
-    update public.coupons set minimum_order = min_spend where minimum_order = 0 and min_spend is not null;
+
+  -- Drop not null on legacy "min_spend" column if it exists
+  if exists (select 1 from information_schema.columns where table_schema='public' and table_name='coupons' and column_name='min_spend') then
+    alter table public.coupons alter column "min_spend" drop not null;
   end if;
+
+  -- Drop legacy check constraint restricting discount_type to ('PERCENT', 'FLAT')
+  alter table public.coupons drop constraint if exists coupons_discount_type_check;
 end $$;
 
--- 2. Create coupon_usages table for atomic tracking and double-spend prevention
+-- 3. Create coupon_usages table for atomic tracking and double-spend prevention
 create table if not exists public.coupon_usages (
   id bigint generated always as identity primary key,
   coupon_id bigint not null references public.coupons(id),
@@ -49,7 +55,7 @@ alter table public.coupon_usages enable row level security;
 grant usage on schema public to service_role;
 grant all privileges on table public.coupon_usages to service_role;
 
--- 3. Stored procedure to atomically record coupon usage and enforce limits
+-- 4. Stored procedure to atomically record coupon usage and enforce limits
 create or replace function public.record_coupon_usages(
   p_coupon_ids bigint[],
   p_user_id bigint,
@@ -113,7 +119,7 @@ $$;
 revoke all on function public.record_coupon_usages(bigint[], bigint, bigint) from public, anon, authenticated;
 grant execute on function public.record_coupon_usages(bigint[], bigint, bigint) to service_role;
 
--- 4. Seed and update standard coupons
+-- 5. Seed and update standard coupons
 insert into public.coupons (code, description, discount_type, discount_value, minimum_order, allowed_payment_methods, first_order_only, per_user_limit, free_delivery, cod_applicable, can_stack, active)
 values
   ('CAKE10', '10% off your cake order', 'PERCENTAGE', 10, 0, array['CARD', 'COD']::text[], false, null, false, true, false, true),
@@ -136,5 +142,16 @@ on conflict (code) do update set
   can_stack = excluded.can_stack,
   active = excluded.active;
 
--- 5. Force PostgREST to reload its schema cache immediately
+-- Sync legacy columns if present
+do $$
+begin
+  if exists (select 1 from information_schema.columns where table_schema='public' and table_name='coupons' and column_name='value') then
+    update public.coupons set "value" = discount_value where "value" is null;
+  end if;
+  if exists (select 1 from information_schema.columns where table_schema='public' and table_name='coupons' and column_name='min_spend') then
+    update public.coupons set "min_spend" = minimum_order where "min_spend" is null;
+  end if;
+end $$;
+
+-- 6. Refresh PostgREST schema cache
 notify pgrst, 'reload schema';
