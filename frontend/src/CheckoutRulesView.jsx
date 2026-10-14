@@ -45,13 +45,18 @@ export default function CheckoutRulesView({ cart, setCart }) {
 
   useEffect(() => {
     api.get('/rulelock/warm').catch(() => {})
-    Promise.all([unwrap(api.get('/auth/me')), unwrap(api.get('/coupons')), unwrap(api.get('/addresses'))])
-      .then(([, couponData, addressData]) => {
-        setCoupons(Array.isArray(couponData.data) ? couponData.data : [])
-        setSecurityMode(couponData.securityMode || 'normal')
-        const saved = Array.isArray(addressData.data) ? addressData.data : []
-        setAddresses(saved)
-        if (saved[0]) setForm((current) => ({ ...current, ...saved[0], postalCode: saved[0].postal_code || '' }))
+    unwrap(api.get('/auth/me'))
+      .then(() => {
+        unwrap(api.get('/coupons')).then((couponData) => {
+          setCoupons(Array.isArray(couponData?.data) ? couponData.data : [])
+          setSecurityMode(couponData?.securityMode || 'normal')
+        }).catch(() => {})
+
+        unwrap(api.get('/addresses')).then((addressData) => {
+          const saved = Array.isArray(addressData?.data) ? addressData.data : []
+          setAddresses(saved)
+          if (saved[0]) setForm((current) => ({ ...current, ...saved[0], postalCode: saved[0].postal_code || '' }))
+        }).catch(() => {})
       })
       .catch(() => navigate('/login'))
   }, [navigate])

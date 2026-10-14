@@ -384,13 +384,15 @@ app.get("/coupons", async (_req, res) => {
     data: (data || []).map((row) => ({
       code: row.code,
       description: row.description,
-      discountType: row.discount_type,
-      discountValue: Number(row.discount_value),
-      minimumOrder: Number(row.minimum_order),
+      discountType: row.discount_type || (row.value ? "PERCENTAGE" : "FIXED"),
+      discountValue: Number(row.discount_value ?? row.value ?? 0),
+      minimumOrder: Number(row.minimum_order ?? row.min_spend ?? 0),
       freeDelivery: row.free_delivery === true,
-      canStack: row.can_stack,
-      codApplicable: row.cod_applicable,
-      allowedPaymentMethods: row.allowed_payment_methods || [],
+      canStack: !!row.can_stack,
+      codApplicable: row.cod_applicable !== false,
+      allowedPaymentMethods: Array.isArray(row.allowed_payment_methods) && row.allowed_payment_methods.length > 0
+        ? row.allowed_payment_methods
+        : ["CARD", "COD"],
       firstOrderOnly: row.first_order_only === true,
     })),
   });
@@ -499,11 +501,17 @@ app.post("/checkout", async (req, res) => {
     return res.status(400).json({ success: false, error: { code: "CHECKOUT_INVALID", message: "Complete your cart, address, and payment method." } });
   }
 
+  let rulelockOn = false;
+  try { rulelockOn = await isRulelockEnabled(); } catch (err) {
+    console.error("Unable to read RuleLock setting:", err.message);
+    rulelockOn = true;
+  }
+
   let subtotal = 0;
   const verifiedItems = [];
   for (const entry of items) {
     const { data: item } = await supabase.from("products").select("*").eq("id", entry.productId).maybeSingle();
-    const quantity = SECURITY_MODE === "research"
+    const quantity = (SECURITY_MODE === "research" || rulelockOn)
       ? Math.max(1, Number(entry.quantity || 1))
       : Math.max(1, Math.min(Number(entry.quantity || 1), 20));
     if (!item || !item.active) {
@@ -575,11 +583,6 @@ app.post("/checkout", async (req, res) => {
   }
   if (error) return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: error.message } });
 
-  let rulelockOn = false;
-  try { rulelockOn = await isRulelockEnabled(); } catch (err) {
-    console.error("Unable to read RuleLock setting:", err.message);
-    rulelockOn = true;
-  }
   let rulelockResult = { decision: "accept", customer_message: "Your order is confirmed." };
   if (rulelockOn) {
     const { pastOrders, pastRefusals } = data.paymentMethod === "COD"
@@ -598,8 +601,8 @@ app.post("/checkout", async (req, res) => {
       accountId: String(user.id),
       userId: user.id,
       customerName: address.recipient || address.name || user.username,
-      coupons: appliedCoupons,
-      discount,
+      coupons: (data.coupons || []).length > appliedCoupons.length ? data.coupons : appliedCoupons,
+      discount: Math.max(discount, submittedDiscount),
       items: verifiedItems,
       subtotal,
       total,
